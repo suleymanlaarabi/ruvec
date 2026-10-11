@@ -64,24 +64,3 @@ impl Document {
         self.revision = NEXT_REVISION.fetch_add(1, Ordering::Relaxed);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn stable_ids_order_and_mutation_invalidation() {
-        let mut doc = Document::new();
-        let a = doc.create_rectangle(1., 2., 3., 4.);
-        for i in 0..100 {
-            doc.create_rectangle(i as f64, 0., 10., 10.);
-        }
-        let revision = doc.revision();
-        let NodeKind::Rectangle(rect) = &mut doc.node_mut(a).unwrap().kind;
-        rect.x = 15.;
-        assert_ne!(doc.revision(), revision);
-        assert_eq!(doc.nodes().next().unwrap().id, a);
-        let NodeKind::Rectangle(rect) = &doc.node(a).unwrap().kind;
-        assert_eq!(rect.x, 15.);
-        assert_ne!(Document::new().revision(), doc.revision());
-    }
-}

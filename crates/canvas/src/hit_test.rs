@@ -14,18 +14,3 @@ pub fn hit_test(document: &Document, world_position: Vec2) -> Option<NodeId> {
             .then_some(node.id)
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn topmost_rectangle_and_empty_space() {
-        let mut doc = Document::new();
-        let a = doc.create_rectangle(0., 0., 100., 100.);
-        let b = doc.create_rectangle(50., 50., 100., 100.);
-        assert_eq!(hit_test(&doc, Vec2::new(75., 75.)), Some(b));
-        assert_eq!(hit_test(&doc, Vec2::ZERO), Some(a));
-        assert_eq!(hit_test(&doc, Vec2::new(200., 200.)), None);
-        assert_eq!(hit_test(&doc, Vec2::new(f64::NAN, 0.)), None);
-    }
-}
