@@ -1,0 +1,4 @@
+/target/
+/vendor/gpui/
+/vendor/gpui-kit/
+__pycache__/

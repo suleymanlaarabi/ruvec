@@ -1,0 +1,21 @@
+[package]
+name = "ruvector-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gpui.workspace = true
+ruvector-canvas.workspace = true
+ruvector-renderer.workspace = true
+tracing.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+gpui_wgpu.workspace = true
+
+[dev-dependencies]
+naga.workspace = true

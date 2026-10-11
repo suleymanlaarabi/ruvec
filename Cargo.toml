@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/desktop", "crates/app", "crates/ui", "crates/canvas",
+    "crates/renderer", "crates/document", "crates/geometry",
+    "crates/commands", "crates/input",
+]
+exclude = ["vendor/gpui", "vendor/gpui-kit"]
+default-members = ["apps/desktop"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+[workspace.dependencies]
+ruvector-app = { path = "crates/app" }
+ruvector-ui = { path = "crates/ui" }
+ruvector-canvas = { path = "crates/canvas" }
+ruvector-renderer = { path = "crates/renderer" }
+ruvector-document = { path = "crates/document" }
+ruvector-geometry = { path = "crates/geometry" }
+ruvector-commands = { path = "crates/commands" }
+ruvector-input = { path = "crates/input" }
+
+gpui = { path = "vendor/gpui/crates/gpui", default-features = false }
+gpui_platform = { path = "vendor/gpui/crates/gpui_platform", features = ["font-kit", "wayland", "x11", "runtime_shaders"] }
+gpui_wgpu = { path = "vendor/gpui/crates/gpui_wgpu" }
+gpui-base = { path = "vendor/gpui-kit/crates/base" }
+wgpu = "=30.0.1"
+naga = { version = "=30.0.1", features = ["wgsl-in"] }
+vello_gpu = "=0.3.0"
+kurbo = "=0.13.1"
+serde = { version = "=1.0.229", features = ["derive"] }
+thiserror = "=2.0.21"
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+rayon = "=1.12.0"
+smallvec = "=1.16.3"
+hashbrown = "=0.17.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

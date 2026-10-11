@@ -1,0 +1,2555 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index b3d85a3..1612747 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -951,7 +951,7 @@ web-sys = "0.3"
+ web-time = "1.1.0"
+ webpki-roots = "1.0.8"
+ webrtc-sys = "0.3.23"
+-wgpu = { version = "29.0", default-features = false }
++wgpu = { version = "=30.0.1", default-features = false }
+ which = "8"
+ windows-core = "0.62"
+ windows-registry = "0.6.0"
+diff --git a/crates/gpui/src/elements/external_compositor.rs b/crates/gpui/src/elements/external_compositor.rs
+new file mode 100644
+index 0000000..edc6b0b
+--- /dev/null
++++ b/crates/gpui/src/elements/external_compositor.rs
+@@ -0,0 +1,139 @@
++use crate::{
++    App, Background, Bounds, Element, ElementId, ExternalSlotHandle, GlobalElementId,
++    InspectorElementId, IntoElement, LayoutId, Length, Pixels, Style, StyleRefinement, Styled,
++    Window, fill, px,
++};
++use refineable::Refineable;
++
++/// An element that composites the content of an [`ExternalSlotHandle`] (see
++/// [`crate::ExternalCompositorRegistry`]) into the scene.
++///
++/// The render backend resolves the handle and draws its content at a controlled
++/// point in the frame. There is no `object_fit` support yet.
++///
++/// Defaults to the slot's native resolution (converted from device texels to
++/// logical pixels via the window's scale factor) unless an explicit `w`/`h` is set
++/// via [`Styled`]; if there is no registry (e.g. macOS/Metal in this phase) or the
++/// handle isn't registered, defaults to zero size instead of guessing.
++pub struct ExternalCompositorElement {
++    handle: ExternalSlotHandle,
++    background: Option<Background>,
++    style: StyleRefinement,
++}
++
++/// Create a new external compositor element for the given slot handle.
++pub fn external_compositor(handle: ExternalSlotHandle) -> ExternalCompositorElement {
++    ExternalCompositorElement {
++        handle,
++        background: None,
++        style: Default::default(),
++    }
++}
++
++impl ExternalCompositorElement {
++    /// Sets a color painted behind the composited texture, at the same bounds,
++    /// before the external compositor primitive: visible while the compositor is
++    /// not ready, on backends without composition support, or showing through
++    /// under translucent content.
++    pub fn background(mut self, color: impl Into<Background>) -> Self {
++        self.background = Some(color.into());
++        self
++    }
++}
++
++impl Element for ExternalCompositorElement {
++    type RequestLayoutState = ();
++    type PrepaintState = ();
++
++    fn id(&self) -> Option<ElementId> {
++        None
++    }
++
++    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
++        None
++    }
++
++    fn request_layout(
++        &mut self,
++        _global_id: Option<&GlobalElementId>,
++        _inspector_id: Option<&InspectorElementId>,
++        window: &mut Window,
++        cx: &mut App,
++    ) -> (LayoutId, Self::RequestLayoutState) {
++        let mut style = Style::default();
++        style.refine(&self.style);
++
++        // Default to the slot's native resolution, the same way `Img` defaults to
++        // an image's natural size (see `elements/img.rs`): only when the caller
++        // hasn't set an explicit `w`/`h` (`Length::Auto`), so an explicit style
++        // always wins. With no registry (e.g. macOS/Metal in this phase) or an
++        // unregistered handle, there's no size to infer, so default to zero rather
++        // than guess.
++        let slot_size = window
++            .external_compositor_registry()
++            .and_then(|registry| registry.borrow().slot_size(self.handle))
++            .map(|size| size.to_pixels(window.scale_factor()));
++
++        if let Length::Auto = style.size.width {
++            style.size.width =
++                Length::Definite(slot_size.map(|size| size.width).unwrap_or(px(0.)).into());
++        }
++        if let Length::Auto = style.size.height {
++            style.size.height =
++                Length::Definite(slot_size.map(|size| size.height).unwrap_or(px(0.)).into());
++        }
++
++        let layout_id = window.request_layout(style, [], cx);
++        (layout_id, ())
++    }
++
++    fn prepaint(
++        &mut self,
++        _global_id: Option<&GlobalElementId>,
++        _inspector_id: Option<&InspectorElementId>,
++        _bounds: Bounds<Pixels>,
++        _request_layout: &mut Self::RequestLayoutState,
++        _window: &mut Window,
++        _cx: &mut App,
++    ) -> Self::PrepaintState {
++    }
++
++    fn paint(
++        &mut self,
++        _global_id: Option<&GlobalElementId>,
++        _inspector_id: Option<&InspectorElementId>,
++        bounds: Bounds<Pixels>,
++        _: &mut Self::RequestLayoutState,
++        _: &mut Self::PrepaintState,
++        window: &mut Window,
++        _: &mut App,
++    ) {
++        // Paint the background first, at the same bounds, before the external
++        // compositor primitive: this gives backends without composition support
++        // (e.g. macOS/Metal in this phase), or a slot with no frame ready yet,
++        // something to show instead of a transparent hole. Backends that do
++        // composite this frame draw over it (the render pass uses `Load`, not
++        // `Clear`, for this primitive), so translucent content painted above this
++        // element still shows the background through, by design (see
++        // `Self::background`).
++        if let Some(color) = self.background {
++            window.paint_quad(fill(bounds, color));
++        }
++
++        window.paint_external_compositor(bounds, self.handle);
++    }
++}
++
++impl IntoElement for ExternalCompositorElement {
++    type Element = Self;
++
++    fn into_element(self) -> Self::Element {
++        self
++    }
++}
++
++impl Styled for ExternalCompositorElement {
++    fn style(&mut self) -> &mut StyleRefinement {
++        &mut self.style
++    }
++}
+diff --git a/crates/gpui/src/elements/mod.rs b/crates/gpui/src/elements/mod.rs
+index 8a2a1b7..666315f 100644
+--- a/crates/gpui/src/elements/mod.rs
++++ b/crates/gpui/src/elements/mod.rs
+@@ -4,6 +4,7 @@ mod canvas;
+ mod container_query;
+ mod deferred;
+ mod div;
++mod external_compositor;
+ mod image_cache;
+ mod img;
+ mod list;
+@@ -18,6 +19,7 @@ pub use canvas::*;
+ pub use container_query::*;
+ pub use deferred::*;
+ pub use div::*;
++pub use external_compositor::*;
+ pub use image_cache::*;
+ pub use img::*;
+ pub use list::*;
+diff --git a/crates/gpui/src/external_compositor.rs b/crates/gpui/src/external_compositor.rs
+new file mode 100644
+index 0000000..d5b3f03
+--- /dev/null
++++ b/crates/gpui/src/external_compositor.rs
+@@ -0,0 +1,890 @@
++//! Backend-neutral external compositor integration.
++//!
++//! This module lets a window register an external, backend-specific compositor (for
++//! example, a wgpu-based 3D renderer) that produces a texture to be composited into a
++//! rectangular region of the GPUI scene. GPUI controls *when* the composition happens
++//! (a controlled point within its own frame, before the frame is submitted), which
++//! preserves draw ordering and lets a single backend own the one GPU submission for
++//! the frame.
++//!
++//! No backend-specific types (e.g. `wgpu`) appear anywhere in this module's public
++//! API, and this module has no notion of a "compose" callback at all: a slot's
++//! compositor is stored as an opaque [`Box<dyn Any>`], entirely defined by the
++//! backend that registered it. For example, the `gpui_wgpu` backend double-boxes a
++//! `Box<dyn gpui_wgpu::WgpuExternalCompositor>` (`Box::new(Box::new(compositor) as
++//! Box<dyn WgpuExternalCompositor>) as Box<dyn Any>`) so that a single
++//! `downcast_mut::<Box<dyn WgpuExternalCompositor>>()` recovers a concrete,
++//! frame-lifetime-safe trait object without ever needing to erase a non-`'static`
++//! lifetime (e.g. a frame-scoped `&mut wgpu::CommandEncoder`) through `Any`.
++//!
++//! Backends resolve a registered slot's compositor via [`ExternalCompositorRegistry::take_compositor`]
++//! / [`ExternalCompositorRegistry::put_back_compositor`] and call into it using their
++//! own backend-specific trait; this module only tracks slot bookkeeping (liveness,
++//! generations, frame-in-flight state).
++
++use crate::{DevicePixels, Size};
++use std::any::Any;
++use std::fmt;
++
++/// An opaque handle to a slot registered with an [`ExternalCompositorRegistry`].
++///
++/// Handles carry a generation counter to guard against ABA problems: once a slot is
++/// freed and its index reused, handles referring to the previous occupant compare
++/// unequal to the new handle and are rejected by the registry as stale.
++/// `generation == 0` is reserved for [`ExternalSlotHandle::INVALID`] and can never be
++/// produced by [`ExternalCompositorRegistry::register`].
++#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
++pub struct ExternalSlotHandle {
++    index: u32,
++    generation: u32,
++}
++
++impl ExternalSlotHandle {
++    /// A handle that never refers to a valid slot.
++    pub const INVALID: Self = Self {
++        index: 0,
++        generation: 0,
++    };
++
++    /// Returns `true` unless this handle is [`Self::INVALID`].
++    ///
++    /// This is a cheap, local check only: it does not guarantee that the slot is
++    /// still registered (or still *live*, as opposed to stale) in any particular
++    /// registry. Use [`ExternalCompositorRegistry::is_valid`] to check liveness.
++    pub fn is_valid(self) -> bool {
++        self.generation != 0
++    }
++}
++
++impl Default for ExternalSlotHandle {
++    fn default() -> Self {
++        Self::INVALID
++    }
++}
++
++/// Pixel format of an external compositor slot's target texture.
++#[derive(Copy, Clone, Debug, PartialEq, Eq)]
++#[non_exhaustive]
++pub enum ExternalSlotFormat {
++    /// 8-bit RGBA, without hardware sRGB decoding.
++    Rgba8Unorm,
++    /// 8-bit RGBA, sRGB-encoded.
++    Rgba8UnormSrgb,
++    /// 8-bit BGRA, sRGB-encoded.
++    Bgra8UnormSrgb,
++    /// 16-bit float RGBA (linear).
++    Rgba16Float,
++}
++
++/// How alpha is encoded in an external compositor slot's target texture.
++#[derive(Copy, Clone, Debug, PartialEq, Eq)]
++pub enum AlphaMode {
++    /// Color channels are already multiplied by alpha.
++    PreMultiplied,
++    /// Color channels are independent of alpha (straight/unassociated alpha).
++    Straight,
++}
++
++/// Immutable metadata describing an external compositor slot, validated when the
++/// slot is registered via [`ExternalCompositorRegistry::register`].
++#[derive(Clone, Debug)]
++pub struct ExternalSlotDescriptor {
++    /// Pixel format of the slot's target texture.
++    pub format: ExternalSlotFormat,
++    /// Alpha encoding of the slot's target texture.
++    pub alpha_mode: AlphaMode,
++    /// Width of the slot's target texture, in texels.
++    pub width: u32,
++    /// Height of the slot's target texture, in texels.
++    pub height: u32,
++    /// Sample count of the slot's target texture. Must be `1`: multisample resolve,
++    /// if any, is the external renderer's responsibility, not GPUI's.
++    pub sample_count: u32,
++    /// The graphics context generation this slot is being registered under. Must
++    /// match [`ExternalCompositorRegistry::current_context_generation`] at the time
++    /// of registration, or [`ExternalCompositorError::GenerationMismatch`] is
++    /// returned.
++    pub context_generation: u64,
++}
++
++/// Errors returned by [`ExternalCompositorRegistry`] operations.
++#[derive(Debug)]
++pub enum ExternalCompositorError {
++    /// The handle does not refer to a currently registered slot: it was never
++    /// registered, has already been unregistered and drained, or refers to a slot
++    /// index that has since been reused by a different registration (an ABA
++    /// mismatch — see [`ExternalCompositorRegistry::unregister`]).
++    StaleHandle,
++    /// The descriptor's `context_generation` did not match the registry's current
++    /// generation.
++    GenerationMismatch {
++        /// The generation the caller supplied.
++        got: u64,
++        /// The registry's current generation.
++        current: u64,
++    },
++    /// The requested format is not supported by the registry.
++    UnsupportedFormat(ExternalSlotFormat),
++    /// `sample_count` must be `1`; multisample resolve is the external renderer's
++    /// responsibility.
++    InvalidSampleCount(u32),
++    /// `width` or `height` was zero, or exceeded `i32::MAX` (the limit every
++    /// consumer of [`DevicePixels`] — a signed 32-bit type — can represent).
++    InvalidDimensions {
++        /// The width the caller supplied.
++        width: u32,
++        /// The height the caller supplied.
++        height: u32,
++    },
++}
++
++/// Outcome of a successful [`ExternalCompositorRegistry::unregister`] call.
++#[derive(Copy, Clone, Debug, PartialEq, Eq)]
++pub enum UnregisterOutcome {
++    /// The slot was freed immediately.
++    ///
++    /// This includes the *context-recreation cleanup* case: unregistering a handle
++    /// that [`ExternalCompositorRegistry::on_context_recreated`] previously marked
++    /// stale always frees it immediately (see that method's docs) — there's nothing
++    /// to defer, since a stale slot is never composed.
++    Removed,
++    /// The slot's most recently painted frame had not yet been composed, so
++    /// freeing it was deferred until composition catches up (see
++    /// [`ExternalCompositorRegistry::drain_pending_removals`]). The slot's
++    /// resources (descriptor, compositor) remain live in the meantime.
++    Deferred {
++        /// The frame the slot was last painted in; composition of this frame must
++        /// complete before the slot is actually freed.
++        until_after_frame: u64,
++    },
++}
++
++impl fmt::Display for ExternalCompositorError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            ExternalCompositorError::StaleHandle => {
++                write!(f, "external compositor handle is stale or unknown")
++            }
++            ExternalCompositorError::GenerationMismatch { got, current } => write!(
++                f,
++                "external compositor context generation mismatch: descriptor has {got}, registry is at {current}"
++            ),
++            ExternalCompositorError::UnsupportedFormat(format) => {
++                write!(f, "unsupported external compositor slot format: {format:?}")
++            }
++            ExternalCompositorError::InvalidSampleCount(count) => write!(
++                f,
++                "invalid external compositor sample count {count}; only 1 is supported"
++            ),
++            ExternalCompositorError::InvalidDimensions { width, height } => write!(
++                f,
++                "external compositor slot dimensions {width}x{height} are invalid: width and \
++                 height must both be non-zero and no greater than {}",
++                i32::MAX
++            ),
++        }
++    }
++}
++
++impl std::error::Error for ExternalCompositorError {}
++
++/// A single slot's mutable bookkeeping. Not exposed outside the registry.
++struct Slot {
++    occupied: bool,
++    generation: u32,
++    /// Set by [`ExternalCompositorRegistry::on_context_recreated`]. A stale slot's
++    /// resources (descriptor, compositor) are kept around — it is *not* freed — but
++    /// [`ExternalCompositorRegistry::is_valid`] reports it as invalid, and backends
++    /// must not compose it (see that method's docs for the full contract).
++    context_stale: bool,
++    pending_removal: bool,
++    descriptor: Option<ExternalSlotDescriptor>,
++    compositor: Option<Box<dyn Any>>,
++    last_painted_frame: u64,
++    /// The `last_painted_frame` value as of the most recent [`ExternalCompositorRegistry::mark_processed`]
++    /// call: i.e. the last painted frame the backend has finished handling, in
++    /// whatever way (composed and drew it, or skipped it for any reason).
++    last_processed_frame: u64,
++}
++
++impl Slot {
++    fn vacant() -> Self {
++        Self {
++            occupied: false,
++            generation: 0,
++            context_stale: false,
++            pending_removal: false,
++            descriptor: None,
++            compositor: None,
++            last_painted_frame: 0,
++            last_processed_frame: 0,
++        }
++    }
++}
++
++/// Per-window registry of external compositor slots.
++///
++/// Shared as `Rc<RefCell<ExternalCompositorRegistry>>` (no `Send`/`Sync` bound: GPUI's
++/// event loop is single-threaded). The [`Window`](crate::Window) paint path inserts a
++/// neutral [`crate::ExternalCompositorPrimitive`] referencing a slot by handle; the
++/// backend renderer later resolves that handle through this registry to reach the
++/// opaque compositor stored in the slot (see [`Self::take_compositor`]).
++///
++/// Slot storage is a small inline slot map (index + generation) with no external
++/// dependency: freed indices are recycled, and their generation is bumped on reuse so
++/// stale handles from a previous occupant are rejected.
++pub struct ExternalCompositorRegistry {
++    slots: Vec<Slot>,
++    free_indices: Vec<u32>,
++    current_context_generation: u64,
++}
++
++impl Default for ExternalCompositorRegistry {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl ExternalCompositorRegistry {
++    /// Creates an empty registry. [`Self::current_context_generation`] starts at `1`,
++    /// matching the convention used by backend graphics contexts (generation `0` is
++    /// reserved to mean "invalid").
++    pub fn new() -> Self {
++        Self {
++            slots: Vec::new(),
++            free_indices: Vec::new(),
++            current_context_generation: 1,
++        }
++    }
++
++    /// The current graphics context generation. Descriptors passed to
++    /// [`Self::register`] must match this value.
++    pub fn current_context_generation(&self) -> u64 {
++        self.current_context_generation
++    }
++
++    /// Registers a new slot with the given descriptor and an opaque,
++    /// backend-defined compositor.
++    ///
++    /// `compositor` is entirely defined by the backend that registers it — this
++    /// module never calls into it. Backends downcast it back via
++    /// [`Self::take_compositor`] using their own backend-specific type (e.g. the
++    /// `gpui_wgpu` backend double-boxes a `Box<dyn WgpuExternalCompositor>`; see the
++    /// module docs).
++    ///
++    /// Validates that `descriptor.context_generation` matches
++    /// [`Self::current_context_generation`], `descriptor.sample_count == 1`, and
++    /// that `descriptor.width`/`descriptor.height` are both non-zero and no
++    /// greater than `i32::MAX` (the limit [`DevicePixels`], a signed 32-bit type,
++    /// can represent). All [`ExternalSlotFormat`] variants are accepted.
++    pub fn register(
++        &mut self,
++        descriptor: ExternalSlotDescriptor,
++        compositor: Box<dyn Any>,
++    ) -> Result<ExternalSlotHandle, ExternalCompositorError> {
++        if descriptor.context_generation != self.current_context_generation {
++            return Err(ExternalCompositorError::GenerationMismatch {
++                got: descriptor.context_generation,
++                current: self.current_context_generation,
++            });
++        }
++        if descriptor.sample_count != 1 {
++            return Err(ExternalCompositorError::InvalidSampleCount(
++                descriptor.sample_count,
++            ));
++        }
++        if descriptor.width == 0
++            || descriptor.height == 0
++            || descriptor.width > i32::MAX as u32
++            || descriptor.height > i32::MAX as u32
++        {
++            return Err(ExternalCompositorError::InvalidDimensions {
++                width: descriptor.width,
++                height: descriptor.height,
++            });
++        }
++
++        let index = if let Some(index) = self.free_indices.pop() {
++            index
++        } else {
++            self.slots.push(Slot::vacant());
++            (self.slots.len() - 1) as u32
++        };
++
++        let slot = &mut self.slots[index as usize];
++        // Bump the generation on every (re)use so a handle from a previous occupant
++        // of this index can never compare equal again. Skip 0, which is reserved for
++        // `ExternalSlotHandle::INVALID`.
++        let generation = slot.generation.wrapping_add(1).max(1);
++        *slot = Slot {
++            occupied: true,
++            generation,
++            context_stale: false,
++            pending_removal: false,
++            descriptor: Some(descriptor),
++            compositor: Some(compositor),
++            last_painted_frame: 0,
++            last_processed_frame: 0,
++        };
++
++        Ok(ExternalSlotHandle { index, generation })
++    }
++
++    /// Unregisters a slot.
++    ///
++    /// Three distinct cases:
++    ///
++    /// - **Context-recreation cleanup**: `handle` refers to a slot previously marked
++    ///   stale by [`Self::on_context_recreated`] (its index and generation still
++    ///   match, but [`Self::is_valid`] reports `false`). Such a slot is never
++    ///   composed by any backend, so there is nothing to wait for: it is freed
++    ///   immediately and this returns `Ok(`[`UnregisterOutcome::Removed`]`)`.
++    /// - **Frame in flight**: `handle` refers to a live (non-stale) slot whose most
++    ///   recently painted frame has not yet been processed by the backend
++    ///   (`last_painted_frame > last_processed_frame`; see [`Self::mark_processed`]).
++    ///   Freeing it now would let the backend's texture disappear out from under a
++    ///   still-pending composite, so
++    ///   this marks the slot for deferred removal (drained automatically by
++    ///   [`Self::drain_pending_removals`] once composition catches up) and returns
++    ///   `Ok(`[`UnregisterOutcome::Deferred`]`)`; the slot's resources stay live in
++    ///   the meantime, still resolvable by the same handle.
++    /// - **Real ABA / unknown handle**: `handle`'s index is out of range, or is
++    ///   occupied by a slot with a different generation (i.e. the index was already
++    ///   freed and reused by an unrelated registration), or is not occupied at all.
++    ///   Returns `Err(`[`ExternalCompositorError::StaleHandle`]`)`.
++    pub fn unregister(
++        &mut self,
++        handle: ExternalSlotHandle,
++    ) -> Result<UnregisterOutcome, ExternalCompositorError> {
++        let index = handle.index as usize;
++        let is_live_index = self
++            .slots
++            .get(index)
++            .is_some_and(|slot| slot.occupied && slot.generation == handle.generation);
++        if !is_live_index {
++            return Err(ExternalCompositorError::StaleHandle);
++        }
++
++        if self.slots[index].context_stale {
++            self.free_slot(handle.index);
++            return Ok(UnregisterOutcome::Removed);
++        }
++
++        let slot = &mut self.slots[index];
++        if slot.last_painted_frame > slot.last_processed_frame {
++            slot.pending_removal = true;
++            return Ok(UnregisterOutcome::Deferred {
++                until_after_frame: slot.last_painted_frame,
++            });
++        }
++        self.free_slot(handle.index);
++        Ok(UnregisterOutcome::Removed)
++    }
++
++    /// The registered size of a slot's target texture, in device texels. This is
++    /// *not* adjusted by the window's DPI scale factor: callers that need logical
++    /// [`crate::Pixels`] (e.g. [`crate::elements::ExternalCompositorElement`]) divide
++    /// by [`crate::Window::scale_factor`] themselves. Returns `None` if `handle` does
++    /// not refer to a live slot.
++    pub fn slot_size(&self, handle: ExternalSlotHandle) -> Option<Size<DevicePixels>> {
++        let descriptor = self.descriptor(handle)?;
++        Some(Size {
++            width: DevicePixels(descriptor.width as i32),
++            height: DevicePixels(descriptor.height as i32),
++        })
++    }
++
++    /// The descriptor a slot was registered with, if it's still occupied (this
++    /// includes slots marked stale by [`Self::on_context_recreated`] and slots
++    /// pending removal, since their resources are still around; use [`Self::is_valid`]
++    /// if you specifically need to know whether the slot is still *composable*).
++    pub fn descriptor(&self, handle: ExternalSlotHandle) -> Option<&ExternalSlotDescriptor> {
++        self.resolve(handle)?.descriptor.as_ref()
++    }
++
++    /// Returns `true` if `handle` refers to a slot that is occupied, *not* marked
++    /// stale by a context recreation, and *not* pending removal (see
++    /// [`Self::unregister`]'s frame-in-flight case). A slot pending removal is a
++    /// zombie kept alive only long enough for the backend to catch up composing
++    /// its last painted frame; it must never be reported valid, or a caller could
++    /// mistake it for a live slot and keep painting into it. Application code that
++    /// holds onto a handle across frames should poll this (e.g. once per frame) to
++    /// discover it needs to unregister the old handle and register a fresh
++    /// compositor.
++    pub fn is_valid(&self, handle: ExternalSlotHandle) -> bool {
++        self.resolve(handle)
++            .is_some_and(|slot| !slot.context_stale && !slot.pending_removal)
++    }
++
++    /// Marks every currently occupied slot stale and advances
++    /// [`Self::current_context_generation`] to `new_generation`. Called by the
++    /// backend after recovering from a lost graphics context (e.g. device-lost on
++    /// wgpu).
++    ///
++    /// This method is intentionally backend-neutral and does *not* touch any slot's
++    /// compositor: this module has no way to call into an opaque `Box<dyn Any>`. It
++    /// is the backend's responsibility to walk every slot returned by
++    /// [`Self::occupied_handles`] (typically right after calling this method) and
++    /// notify each compositor through its own backend-specific extension trait
++    /// (e.g. `gpui_wgpu::WgpuExternalCompositor::on_context_recreated`).
++    ///
++    /// Marked-stale slots are *not* freed here: their descriptor and compositor stay
++    /// live so the backend's notification walk (and any composition attempted before
++    /// the app catches up) can still resolve them, and so
++    /// [`Self::unregister`]'s context-recreation cleanup case can drop them once the
++    /// app is done with them. [`Self::is_valid`] reports `false` for them in the
++    /// meantime.
++    ///
++    /// This is a backend API (called by e.g. `gpui_wgpu`'s renderer after device
++    /// recovery), not for application use.
++    #[doc(hidden)]
++    pub fn on_context_recreated(&mut self, new_generation: u64) {
++        for slot in &mut self.slots {
++            if slot.occupied {
++                slot.context_stale = true;
++            }
++        }
++        self.current_context_generation = new_generation;
++    }
++
++    /// Iterates the handles of every currently occupied slot, including ones marked
++    /// stale by [`Self::on_context_recreated`] (their resources, and compositor, are
++    /// still live until an explicit [`Self::unregister`] cleans them up). This is a
++    /// backend API (e.g. used by `gpui_wgpu`'s renderer to walk every compositor
++    /// after device recovery and notify it via a backend-specific extension trait),
++    /// not for app use.
++    #[doc(hidden)]
++    pub fn occupied_handles(&self) -> impl Iterator<Item = ExternalSlotHandle> + '_ {
++        self.slots
++            .iter()
++            .enumerate()
++            .filter(|(_, slot)| slot.occupied)
++            .map(|(index, slot)| ExternalSlotHandle {
++                index: index as u32,
++                generation: slot.generation,
++            })
++    }
++
++    /// Records that `handle`'s slot was painted (i.e. its primitive was inserted into
++    /// the scene) as part of `frame`. Called by [`crate::Window::paint_external_compositor`].
++    ///
++    /// A no-op on a slot pending removal (see [`Self::unregister`]'s frame-in-flight
++    /// case): such a slot is a zombie waiting only for the backend to catch up on
++    /// its *last* painted frame, and letting a further (stale) paint push
++    /// `last_painted_frame` forward would extend its life indefinitely instead of
++    /// letting [`Self::drain_pending_removals`] free it.
++    pub(crate) fn mark_painted(&mut self, handle: ExternalSlotHandle, frame: u64) {
++        if let Some(slot) = self.resolve_mut(handle)
++            && !slot.pending_removal
++        {
++            slot.last_painted_frame = frame;
++        }
++    }
++
++    /// Records that `handle`'s slot was processed this frame by the backend: its
++    /// most recently painted frame was either composed and drawn, or skipped for
++    /// any reason (not ready yet, a lost graphics context, a stale context
++    /// generation, or any other non-fatal condition) — in every case, nothing about
++    /// this slot is left in flight. Sets the slot's `last_processed_frame` to its
++    /// current `last_painted_frame`.
++    ///
++    /// This intentionally takes no explicit frame number: the backend processes
++    /// exactly the primitives painted into the scene it is currently drawing, so
++    /// "processed" always means "caught up with the most recent paint", without
++    /// requiring the backend to share gpui's [`crate::Window::frame_counter`]
++    /// numbering. Backends must call this for every slot present in the scene being
++    /// drawn, regardless of outcome — see [`Self::drain_pending_removals`], which
++    /// depends on it to free slots pending removal. This is a backend API, not for
++    /// app use.
++    #[doc(hidden)]
++    pub fn mark_processed(&mut self, handle: ExternalSlotHandle) {
++        if let Some(slot) = self.resolve_mut(handle) {
++            slot.last_processed_frame = slot.last_painted_frame;
++        }
++    }
++
++    /// Removes and returns `handle`'s compositor, if any, so the backend renderer can
++    /// call into it without holding a borrow of this registry (which may itself be
++    /// reachable through the same `RefCell` the compositor needs to touch). Pair with
++    /// [`Self::put_back_compositor`]. This is a backend API, not for app use.
++    ///
++    /// Resolves slots marked stale by [`Self::on_context_recreated`] too (their
++    /// compositor is still live); backends that must not compose a stale slot are
++    /// expected to check [`Self::is_valid`] (or compare
++    /// [`Self::descriptor`]'s `context_generation`) themselves before calling this.
++    #[doc(hidden)]
++    pub fn take_compositor(&mut self, handle: ExternalSlotHandle) -> Option<Box<dyn Any>> {
++        self.resolve_mut(handle)?.compositor.take()
++    }
++
++    /// Restores a compositor previously removed by [`Self::take_compositor`]. If the
++    /// slot is no longer occupied (e.g. it was freed by [`Self::unregister`] in the
++    /// interim), the compositor is dropped.
++    /// This is a backend API, not for app use.
++    #[doc(hidden)]
++    pub fn put_back_compositor(&mut self, handle: ExternalSlotHandle, compositor: Box<dyn Any>) {
++        if let Some(slot) = self.resolve_mut(handle) {
++            slot.compositor = Some(compositor);
++        }
++    }
++
++    /// Marks the submitted scene as processed, including retired slots omitted
++    /// after a failed presentation was replaced by a resize or another scene.
++    /// Call only after submitting the current window's command buffer.
++    #[doc(hidden)]
++    pub fn mark_frame_submitted(&mut self) {
++        for slot in &mut self.slots {
++            if slot.occupied {
++                slot.last_processed_frame = slot.last_painted_frame;
++            }
++        }
++        self.drain_pending_removals();
++    }
++
++    /// Frees every slot marked for deferred removal whose last painted frame has
++    /// since been processed (`last_processed_frame >= last_painted_frame`; see
++    /// [`Self::mark_processed`]). Called by the backend renderer once per frame,
++    /// after the frame that processed those slots actually landed (e.g. after the
++    /// main encoder submit succeeded). This is a backend API, not for app use.
++    #[doc(hidden)]
++    pub fn drain_pending_removals(&mut self) {
++        for index in 0..self.slots.len() {
++            let slot = &self.slots[index];
++            if slot.occupied
++                && slot.pending_removal
++                && slot.last_processed_frame >= slot.last_painted_frame
++            {
++                self.free_slot(index as u32);
++            }
++        }
++    }
++
++    fn resolve(&self, handle: ExternalSlotHandle) -> Option<&Slot> {
++        let slot = self.slots.get(handle.index as usize)?;
++        (slot.occupied && slot.generation == handle.generation).then_some(slot)
++    }
++
++    fn resolve_mut(&mut self, handle: ExternalSlotHandle) -> Option<&mut Slot> {
++        let slot = self.slots.get_mut(handle.index as usize)?;
++        (slot.occupied && slot.generation == handle.generation).then_some(slot)
++    }
++
++    fn free_slot(&mut self, index: u32) {
++        if let Some(slot) = self.slots.get_mut(index as usize) {
++            slot.occupied = false;
++            slot.context_stale = false;
++            slot.pending_removal = false;
++            slot.descriptor = None;
++            slot.compositor = None;
++            self.free_indices.push(index);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn dummy_compositor() -> Box<dyn Any> {
++        Box::new(())
++    }
++
++    fn descriptor(context_generation: u64) -> ExternalSlotDescriptor {
++        ExternalSlotDescriptor {
++            format: ExternalSlotFormat::Rgba8UnormSrgb,
++            alpha_mode: AlphaMode::PreMultiplied,
++            width: 64,
++            height: 64,
++            sample_count: 1,
++            context_generation,
++        }
++    }
++
++    #[test]
++    fn register_and_unregister() {
++        let mut registry = ExternalCompositorRegistry::new();
++        let handle = registry
++            .register(descriptor(1), dummy_compositor())
++            .expect("register should succeed");
++        assert!(handle.is_valid());
++        assert!(registry.is_valid(handle));
++        assert!(registry.descriptor(handle).is_some());
++
++        registry
++            .unregister(handle)
++            .expect("unregister should succeed");
++        assert!(registry.descriptor(handle).is_none());
++    }
++
++    #[test]
++    fn generation_mismatch_is_rejected() {
++        let mut registry = ExternalCompositorRegistry::new();
++        let err = registry
++            .register(descriptor(2), dummy_compositor())
++            .unwrap_err();
++        assert!(matches!(
++            err,
++            ExternalCompositorError::GenerationMismatch { got: 2, current: 1 }
++        ));
++    }
++
++    #[test]
++    fn invalid_descriptors_are_rejected() {
++        let mut registry = ExternalCompositorRegistry::new();
++
++        let mut bad_sample_count = descriptor(1);
++        bad_sample_count.sample_count = 4;
++        assert!(matches!(
++            registry.register(bad_sample_count, dummy_compositor()),
++            Err(ExternalCompositorError::InvalidSampleCount(4))
++        ));
++
++        let mut zero_width = descriptor(1);
++        zero_width.width = 0;
++        assert!(matches!(
++            registry.register(zero_width, dummy_compositor()),
++            Err(ExternalCompositorError::InvalidDimensions {
++                width: 0,
++                height: 64
++            })
++        ));
++    }
++
++    #[test]
++    fn oversized_dimensions_are_rejected() {
++        let mut registry = ExternalCompositorRegistry::new();
++
++        let mut huge_width = descriptor(1);
++        huge_width.width = i32::MAX as u32 + 1;
++        assert!(matches!(
++            registry.register(huge_width, dummy_compositor()),
++            Err(ExternalCompositorError::InvalidDimensions { width, height: 64 })
++                if width == i32::MAX as u32 + 1
++        ));
++
++        let mut huge_height = descriptor(1);
++        huge_height.height = i32::MAX as u32 + 1;
++        assert!(matches!(
++            registry.register(huge_height, dummy_compositor()),
++            Err(ExternalCompositorError::InvalidDimensions { width: 64, height })
++                if height == i32::MAX as u32 + 1
++        ));
++    }
++
++    #[test]
++    fn context_recreation_marks_slots_stale_without_freeing() {
++        let mut registry = ExternalCompositorRegistry::new();
++        let handle = registry
++            .register(descriptor(1), dummy_compositor())
++            .unwrap();
++
++        registry.on_context_recreated(2);
++        assert_eq!(registry.current_context_generation(), 2);
++        // Stale, but its resources (descriptor, compositor) are still around until
++        // an explicit cleanup unregister.
++        assert!(!registry.is_valid(handle));
++        assert!(registry.descriptor(handle).is_some());
++        assert_eq!(registry.occupied_handles().collect::<Vec<_>>(), [handle]);
++
++        // Registering under the new generation succeeds and produces a fresh
++        // handle that never compares equal to the stale one (it lands in a new
++        // slot: the stale one hasn't been freed yet, so its index isn't reusable).
++        let new_handle = registry
++            .register(descriptor(2), dummy_compositor())
++            .unwrap();
++        assert_ne!(handle, new_handle);
++        assert!(registry.is_valid(new_handle));
++
++        // Cleanup unregister of the now-stale handle succeeds and frees it
++        // immediately (no frame-in-flight deferral for stale slots).
++        assert_eq!(
++            registry.unregister(handle).unwrap(),
++            UnregisterOutcome::Removed
++        );
++        assert!(registry.descriptor(handle).is_none());
++    }
++
++    #[test]
++    fn unregister_after_real_aba_is_rejected() {
++        let mut registry = ExternalCompositorRegistry::new();
++        let handle = registry
++            .register(descriptor(1), dummy_compositor())
++            .unwrap();
++        assert_eq!(
++            registry.unregister(handle).unwrap(),
++            UnregisterOutcome::Removed
++        );
++
++        // The freed index gets reused by this registration, with a bumped
++        // generation, by an entirely unrelated caller.
++        let reused = registry
++            .register(descriptor(1), dummy_compositor())
++            .unwrap();
++        assert_ne!(handle, reused);
++
++        // The original handle must not be treated as a valid cleanup target for
++        // the slot now occupied by `reused`.
++        assert!(matches!(
++            registry.unregister(handle),
++            Err(ExternalCompositorError::StaleHandle)
++        ));
++        assert!(registry.is_valid(reused));
++    }
++
++    #[test]
++    fn frame_in_flight_defers_removal_until_processed() {
++        let mut registry = ExternalCompositorRegistry::new();
++        let handle = registry
++            .register(descriptor(1), dummy_compositor())
++            .unwrap();
++
++        registry.mark_painted(handle, 5);
++        let result = registry.unregister(handle);
++        assert!(matches!(
++            result,
++            Ok(UnregisterOutcome::Deferred {
++                until_after_frame: 5
++            })
++        ));
++        // Marked for deferred removal, but still resolvable: its resources are
++        // still needed until the backend catches up processing it.
++        assert!(registry.descriptor(handle).is_some());
++
++        registry.drain_pending_removals();
++        // Not processed yet, so it must still be alive.
++        assert!(registry.descriptor(handle).is_some());
++
++        registry.mark_processed(handle);
++        registry.drain_pending_removals();
++        assert!(registry.descriptor(handle).is_none());
++    }
++
++    #[test]
++    fn notready_outcome_still_drains_deferred_removal() {
++        // A slot pending removal isn't only unblocked by a `Ready` compose: the
++        // backend calls `mark_processed` for every outcome (NotReady, ContextLost,
++        // a stale context generation, a downcast failure, ...), since in every
++        // case there is nothing left in flight for that slot this frame.
++        let mut registry = ExternalCompositorRegistry::new();
++        let handle = registry
++            .register(descriptor(1), dummy_compositor())
++            .unwrap();
++
++        registry.mark_painted(handle, 1);
++        assert!(matches!(
++            registry.unregister(handle),
++            Ok(UnregisterOutcome::Deferred {
++                until_after_frame: 1
++            })
++        ));
++
++        registry.mark_processed(handle);
++        registry.drain_pending_removals();
++        assert!(registry.descriptor(handle).is_none());
++    }
++
++    #[test]
++    fn pending_removal_slot_is_invalid_and_rejects_further_paints() {
++        let mut registry = ExternalCompositorRegistry::new();
++        let handle = registry
++            .register(descriptor(1), dummy_compositor())
++            .unwrap();
++
++        registry.mark_painted(handle, 1);
++        assert!(matches!(
++            registry.unregister(handle),
++            Ok(UnregisterOutcome::Deferred {
++                until_after_frame: 1
++            })
++        ));
++        assert!(!registry.is_valid(handle));
++
++        // A stray paint on an already-pending-removal slot (e.g. a caller that
++        // hasn't noticed `is_valid` went false yet) must not extend the zombie's
++        // life by pushing `last_painted_frame` forward. Observe this indirectly
++        // through `unregister`, which reports the slot's current
++        // `last_painted_frame` as `until_after_frame`: if the stray paint had taken
++        // effect, this would now report `99` instead of the original `1`.
++        registry.mark_painted(handle, 99);
++        assert!(matches!(
++            registry.unregister(handle),
++            Ok(UnregisterOutcome::Deferred {
++                until_after_frame: 1
++            })
++        ));
++    }
++
++    #[test]
++    fn unregister_without_frame_in_flight_frees_immediately() {
++        let mut registry = ExternalCompositorRegistry::new();
++        let handle = registry
++            .register(descriptor(1), dummy_compositor())
++            .unwrap();
++        assert_eq!(
++            registry.unregister(handle).unwrap(),
++            UnregisterOutcome::Removed
++        );
++        assert!(registry.descriptor(handle).is_none());
++    }
++
++    #[test]
++    fn unregister_unknown_handle_is_rejected() {
++        let mut registry = ExternalCompositorRegistry::new();
++        assert!(matches!(
++            registry.unregister(ExternalSlotHandle {
++                index: 0,
++                generation: 1
++            }),
++            Err(ExternalCompositorError::StaleHandle)
++        ));
++    }
++
++    #[test]
++    fn replacement_scene_retires_slots_from_an_abandoned_frame() {
++        let mut registry = ExternalCompositorRegistry::new();
++        let retired = registry
++            .register(descriptor(1), dummy_compositor())
++            .unwrap();
++        registry.mark_painted(retired, 1);
++        assert!(matches!(
++            registry.unregister(retired).unwrap(),
++            UnregisterOutcome::Deferred { .. }
++        ));
++        let replacement = registry
++            .register(descriptor(1), dummy_compositor())
++            .unwrap();
++        registry.mark_painted(replacement, 2);
++        // Presentation of frame 1 failed. Frame 2 no longer references retired.
++        registry.mark_frame_submitted();
++        assert!(registry.descriptor(retired).is_none());
++        assert!(registry.is_valid(replacement));
++    }
++
++    #[test]
++    fn take_and_put_back_compositor() {
++        let mut registry = ExternalCompositorRegistry::new();
++        let handle = registry
++            .register(descriptor(1), Box::new(42_u32) as Box<dyn Any>)
++            .unwrap();
++
++        let mut compositor = registry
++            .take_compositor(handle)
++            .expect("compositor should be present");
++        assert!(registry.take_compositor(handle).is_none());
++        assert_eq!(compositor.downcast_mut::<u32>(), Some(&mut 42));
++
++        registry.put_back_compositor(handle, compositor);
++        assert!(registry.take_compositor(handle).is_some());
++    }
++
++    #[test]
++    fn slot_size_reports_device_texels() {
++        let mut registry = ExternalCompositorRegistry::new();
++        let handle = registry
++            .register(descriptor(1), dummy_compositor())
++            .unwrap();
++        let size = registry.slot_size(handle).unwrap();
++        assert_eq!(size.width, DevicePixels(64));
++        assert_eq!(size.height, DevicePixels(64));
++    }
++}
+diff --git a/crates/gpui/src/gpui.rs b/crates/gpui/src/gpui.rs
+index d4da5aa..7833b58 100644
+--- a/crates/gpui/src/gpui.rs
++++ b/crates/gpui/src/gpui.rs
+@@ -21,6 +21,7 @@ mod debug_overlay;
+ mod element;
+ mod elements;
+ mod executor;
++mod external_compositor;
+ mod platform_scheduler;
+ pub(crate) use platform_scheduler::PlatformScheduler;
+ mod geometry;
+@@ -110,6 +111,7 @@ pub use debug_overlay::*;
+ pub use element::*;
+ pub use elements::*;
+ pub use executor::*;
++pub use external_compositor::*;
+ pub use geometry::*;
+ pub use gestures::*;
+ pub use global::*;
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index c08d964..0b0e16b 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -1278,6 +1278,17 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
+     fn is_subpixel_rendering_supported(&self) -> bool;
+ 
++    /// Returns this window's [`ExternalCompositorRegistry`](crate::ExternalCompositorRegistry),
++    /// if the backend supports external composition. The default implementation
++    /// returns `None`, which is appropriate for backends that don't support it (e.g.
++    /// headless/test windows, or platforms without a renderer that implements the
++    /// `ExternalCompositors` scene batch, such as macOS/Metal in this phase).
++    fn external_compositor_registry(
++        &self,
++    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::ExternalCompositorRegistry>>> {
++        None
++    }
++
+     // macOS specific methods
+     fn get_title(&self) -> String {
+         String::new()
+diff --git a/crates/gpui/src/scene.rs b/crates/gpui/src/scene.rs
+index be37813..82d7e6a 100644
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -5,8 +5,8 @@ use schemars::JsonSchema;
+ use serde::{Deserialize, Serialize};
+ 
+ use crate::{
+-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
+-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
++    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, ExternalSlotHandle,
++    Hsla, Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+ };
+ use std::{
+     fmt::Debug,
+@@ -50,6 +50,7 @@ pub struct Scene {
+     pub subpixel_sprites: Vec<SubpixelSprite>,
+     pub polychrome_sprites: Vec<PolychromeSprite>,
+     pub surfaces: Vec<PaintSurface>,
++    pub external_compositors: Vec<ExternalCompositorPrimitive>,
+ }
+ 
+ #[expect(missing_docs)]
+@@ -66,6 +67,7 @@ impl Scene {
+         self.subpixel_sprites.clear();
+         self.polychrome_sprites.clear();
+         self.surfaces.clear();
++        self.external_compositors.clear();
+     }
+ 
+     pub fn len(&self) -> usize {
+@@ -133,6 +135,10 @@ impl Scene {
+                 surface.order = order;
+                 self.surfaces.push(surface.clone());
+             }
++            Primitive::ExternalCompositor(external_compositor) => {
++                external_compositor.order = order;
++                self.external_compositors.push(external_compositor.clone());
++            }
+         }
+         self.paint_operations
+             .push(PaintOperation::Primitive(primitive));
+@@ -160,6 +166,8 @@ impl Scene {
+         self.polychrome_sprites
+             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+         self.surfaces.sort_by_key(|surface| surface.order);
++        self.external_compositors
++            .sort_by_key(|external_compositor| external_compositor.order);
+     }
+ 
+     #[cfg_attr(
+@@ -187,6 +195,8 @@ impl Scene {
+             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
+             surfaces_start: 0,
+             surfaces_iter: self.surfaces.iter().peekable(),
++            external_compositors_start: 0,
++            external_compositors_iter: self.external_compositors.iter().peekable(),
+         }
+     }
+ }
+@@ -209,6 +219,7 @@ pub(crate) enum PrimitiveKind {
+     SubpixelSprite,
+     PolychromeSprite,
+     Surface,
++    ExternalCompositor,
+ }
+ 
+ pub(crate) enum PaintOperation {
+@@ -228,6 +239,7 @@ pub enum Primitive {
+     SubpixelSprite(SubpixelSprite),
+     PolychromeSprite(PolychromeSprite),
+     Surface(PaintSurface),
++    ExternalCompositor(ExternalCompositorPrimitive),
+ }
+ 
+ #[expect(missing_docs)]
+@@ -242,6 +254,7 @@ impl Primitive {
+             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
+             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
+             Primitive::Surface(surface) => &surface.bounds,
++            Primitive::ExternalCompositor(external_compositor) => &external_compositor.bounds,
+         }
+     }
+ 
+@@ -255,6 +268,7 @@ impl Primitive {
+             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
+             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
+             Primitive::Surface(surface) => &surface.content_mask,
++            Primitive::ExternalCompositor(external_compositor) => &external_compositor.content_mask,
+         }
+     }
+ }
+@@ -283,6 +297,8 @@ struct BatchIterator<'a> {
+     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
+     surfaces_start: usize,
+     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
++    external_compositors_start: usize,
++    external_compositors_iter: Peekable<slice::Iter<'a, ExternalCompositorPrimitive>>,
+ }
+ 
+ impl<'a> Iterator for BatchIterator<'a> {
+@@ -316,6 +332,10 @@ impl<'a> Iterator for BatchIterator<'a> {
+                 self.surfaces_iter.peek().map(|s| s.order),
+                 PrimitiveKind::Surface,
+             ),
++            (
++                self.external_compositors_iter.peek().map(|p| p.order),
++                PrimitiveKind::ExternalCompositor,
++            ),
+         ];
+         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
+ 
+@@ -461,6 +481,24 @@ impl<'a> Iterator for BatchIterator<'a> {
+                 self.surfaces_start = surfaces_end;
+                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
+             }
++            PrimitiveKind::ExternalCompositor => {
++                let external_compositors_start = self.external_compositors_start;
++                let mut external_compositors_end = external_compositors_start + 1;
++                self.external_compositors_iter.next();
++                while self
++                    .external_compositors_iter
++                    .next_if(|external_compositor| {
++                        (external_compositor.order, batch_kind) < max_order_and_kind
++                    })
++                    .is_some()
++                {
++                    external_compositors_end += 1;
++                }
++                self.external_compositors_start = external_compositors_end;
++                Some(PrimitiveBatch::ExternalCompositors(
++                    external_compositors_start..external_compositors_end,
++                ))
++            }
+         }
+     }
+ }
+@@ -493,6 +531,7 @@ pub enum PrimitiveBatch {
+         range: Range<usize>,
+     },
+     Surfaces(Range<usize>),
++    ExternalCompositors(Range<usize>),
+ }
+ 
+ impl PrimitiveBatch {
+@@ -525,6 +564,7 @@ impl PrimitiveBatch {
+                 )
+             }
+             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
++            Self::ExternalCompositors(range) => format!("external compositors ({})", range.len()),
+         }
+     }
+ }
+@@ -779,6 +819,28 @@ impl From<PaintSurface> for Primitive {
+     }
+ }
+ 
++/// A reference to an [`ExternalSlotHandle`] positioned in the scene. The referenced
++/// slot's content is drawn by the backend renderer, outside of `scene.rs`: this
++/// primitive only carries the placement (bounds, content mask, and draw order) and an
++/// opaque handle used to look the slot up in the window's
++/// [`crate::ExternalCompositorRegistry`]. Unlike [`PaintSurface`], this primitive is
++/// not platform-gated: every backend receives it and decides how (or whether) to
++/// composite it.
++#[derive(Clone, Debug)]
++#[expect(missing_docs)]
++pub struct ExternalCompositorPrimitive {
++    pub order: DrawOrder,
++    pub bounds: Bounds<ScaledPixels>,
++    pub content_mask: ContentMask<ScaledPixels>,
++    pub handle: ExternalSlotHandle,
++}
++
++impl From<ExternalCompositorPrimitive> for Primitive {
++    fn from(external_compositor: ExternalCompositorPrimitive) -> Self {
++        Primitive::ExternalCompositor(external_compositor)
++    }
++}
++
+ #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+ #[expect(missing_docs)]
+ pub struct PathId(pub usize);
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 1214b03..842107b 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -9,8 +9,9 @@ use crate::{
+     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
+     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
+-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
+-    Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
++    EntityId, EventEmitter, ExternalCompositorPrimitive, ExternalCompositorRegistry,
++    ExternalSlotHandle, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla,
++    InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+     Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+@@ -1273,6 +1274,12 @@ pub struct Window {
+         SubscriberSet<(), Box<dyn FnMut(WindowVisibility, &mut Window, &mut App) -> bool>>,
+     hovered: Rc<Cell<bool>>,
+     pub(crate) needs_present: Rc<Cell<bool>>,
++    /// Monotonically incremented once per call to [`Window::draw`]. Used to order
++    /// external compositor frame-in-flight tracking (see
++    /// [`ExternalCompositorRegistry`]): elements record the frame they painted a slot
++    /// in, and the backend renderer records the frame it composited that slot in, so
++    /// the registry can tell whether a slot's texture is still needed before freeing it.
++    pub(crate) frame_counter: u64,
+     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
+     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
+     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
+@@ -2172,6 +2179,7 @@ impl Window {
+             visibility_observers: SubscriberSet::new(),
+             hovered,
+             needs_present,
++            frame_counter: 0,
+             input_rate_tracker,
+             #[cfg(feature = "profiler")]
+             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
+@@ -3099,6 +3107,21 @@ impl Window {
+         self.refresh();
+     }
+ 
++    /// The monotonically increasing counter of frames drawn by this window so far
++    /// (see [`Window::draw`]). Used to correlate external compositor paint and
++    /// composite calls across the render backend; see [`ExternalCompositorRegistry`].
++    pub fn frame_counter(&self) -> u64 {
++        self.frame_counter
++    }
++
++    /// This window's external compositor registry, if the platform backend supports
++    /// external composition (see [`ExternalCompositorRegistry`]). Returns `None` on
++    /// backends without support (e.g. headless/test windows, or macOS/Metal in this
++    /// phase).
++    pub fn external_compositor_registry(&self) -> Option<Rc<RefCell<ExternalCompositorRegistry>>> {
++        self.platform_window.external_compositor_registry()
++    }
++
+     /// The size of an em for the base font of the application. Adjusting this value allows the
+     /// UI to scale, just like zooming a web page.
+     pub fn rem_size(&self) -> Pixels {
+@@ -3421,6 +3444,11 @@ impl Window {
+     /// the contents of the new [`Scene`], use [`Self::present`].
+     #[profiling::function]
+     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
++        // Advance the frame counter before painting so that elements painting an
++        // external compositor primitive this frame (see `paint_external_compositor`)
++        // record the frame that is about to be drawn, not the previous one.
++        self.frame_counter = self.frame_counter.wrapping_add(1);
++
+         // Drain every draw in profiler builds so a previous frame's
+         // first-invalidation timestamp can't be attributed to this one.
+         #[cfg(feature = "profiler")]
+@@ -5171,6 +5199,44 @@ impl Window {
+         });
+     }
+ 
++    /// Paint an external compositor slot into the scene for the next frame at the
++    /// current z-index.
++    ///
++    /// This inserts a neutral [`ExternalCompositorPrimitive`] into the scene; no
++    /// backend-specific work happens here; the render backend resolves `handle`
++    /// against the window's [`ExternalCompositorRegistry`] and composites it at a
++    /// controlled point later in the frame, using its own backend-specific
++    /// composition trait (e.g. `gpui_wgpu::WgpuExternalCompositor`). If the window
++    /// has a registry (see [`Window::external_compositor_registry`]), this also
++    /// records that `handle`'s slot was painted in the current frame, so the
++    /// registry can enforce its frame-in-flight contract on unregister.
++    ///
++    /// This method should only be called as part of the paint phase of element drawing.
++    pub fn paint_external_compositor(
++        &mut self,
++        bounds: Bounds<Pixels>,
++        handle: ExternalSlotHandle,
++    ) {
++        self.invalidator.debug_assert_paint();
++
++        let bounds = self.snap_bounds(bounds);
++        let content_mask = self.snapped_content_mask();
++        self.next_frame
++            .scene
++            .insert_primitive(ExternalCompositorPrimitive {
++                order: 0,
++                bounds,
++                content_mask,
++                handle,
++            });
++
++        if let Some(registry) = self.external_compositor_registry() {
++            registry
++                .borrow_mut()
++                .mark_painted(handle, self.frame_counter);
++        }
++    }
++
+     /// Removes an image from the sprite atlas.
+     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
+         for frame_index in 0..data.frame_count() {
+diff --git a/crates/gpui_apple/src/metal_renderer.rs b/crates/gpui_apple/src/metal_renderer.rs
+index e466205..44d65e8 100644
+--- a/crates/gpui_apple/src/metal_renderer.rs
++++ b/crates/gpui_apple/src/metal_renderer.rs
+@@ -785,6 +785,7 @@ impl MetalRenderer {
+                         viewport_size,
+                         command_encoder,
+                     ),
++                PrimitiveBatch::ExternalCompositors(_) => {}
+                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
+                     &scene.surfaces[range.clone()],
+                     range.start,
+diff --git a/crates/gpui_linux/src/linux/wayland/client.rs b/crates/gpui_linux/src/linux/wayland/client.rs
+index 84f4d0f..2104a5e 100644
+--- a/crates/gpui_linux/src/linux/wayland/client.rs
++++ b/crates/gpui_linux/src/linux/wayland/client.rs
+@@ -1027,7 +1027,7 @@ impl WaylandConnection {
+         })?;
+ 
+         let compositor_gpu = detect_compositor_gpu();
+-        let gpu_context = Rc::new(RefCell::new(None));
++        let gpu_context = Rc::new(gpui_wgpu::SharedGpuContext::new());
+ 
+         let (frame_ping, frame_ping_source) =
+             calloop::ping::make_ping().context("failed to create Wayland frame ping")?;
+diff --git a/crates/gpui_linux/src/linux/wayland/window.rs b/crates/gpui_linux/src/linux/wayland/window.rs
+index 8d92234..911b65f 100644
+--- a/crates/gpui_linux/src/linux/wayland/window.rs
++++ b/crates/gpui_linux/src/linux/wayland/window.rs
+@@ -34,12 +34,12 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
+ use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
+ use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
+ use gpui::{
+-    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, ExternalDragPayload,
+-    FrameRequestSource, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay,
+-    PlatformFrameSignal, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
+-    PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, Tiling, WindowAppearance,
+-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
+-    WindowKind, WindowParams, WindowVisibility,
++    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, ExternalCompositorRegistry,
++    ExternalDragPayload, FrameRequestSource, GpuSpecs, Modifiers, Pixels, PlatformAtlas,
++    PlatformDisplay, PlatformFrameSignal, PlatformInput, PlatformInputHandler, PlatformWindow,
++    Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, Tiling,
++    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
++    WindowDecorations, WindowKind, WindowParams, WindowVisibility,
+     layer_shell::{Anchor, LayerShellNotSupportedError},
+     popup::PopupOptions,
+     px, size,
+@@ -116,6 +116,7 @@ pub struct WaylandWindowState {
+     /// Taken when the window is dropped. Its GPU objects use the Wayland connection, so they
+     /// mustn't outlive the window, which a display mode switch relies on.
+     renderer: Option<WgpuRenderer>,
++    external_compositors: Rc<RefCell<ExternalCompositorRegistry>>,
+     bounds: Bounds<Pixels>,
+     scale: f32,
+     input_handler: Option<PlatformInputHandler>,
+@@ -565,6 +566,7 @@ impl WaylandWindowState {
+         options: WindowParams,
+         parent: Option<WaylandWindowStatePtr>,
+     ) -> anyhow::Result<Self> {
++        let external_compositors = Rc::new(RefCell::new(ExternalCompositorRegistry::new()));
+         let renderer = {
+             let raw_window = RawWindow {
+                 window: surface.id().as_ptr().cast::<c_void>(),
+@@ -584,7 +586,13 @@ impl WaylandWindowState {
+                 // Prefer Mailbox to avoid blocking. Falls back to FIFO if Mailbox is unsupported.
+                 preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
+             };
+-            WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?
++            WgpuRenderer::new(
++                gpu_context,
++                &raw_window,
++                config,
++                compositor_gpu,
++                Some(Rc::clone(&external_compositors)),
++            )?
+         };
+ 
+         if let WaylandSurfaceState::Xdg(ref xdg_state) = surface_state {
+@@ -616,6 +624,7 @@ impl WaylandWindowState {
+             outputs: HashMap::default(),
+             display: None,
+             renderer: Some(renderer),
++            external_compositors,
+             bounds: options.bounds,
+             scale: 1.0,
+             input_handler: None,
+@@ -1920,6 +1929,7 @@ impl PlatformWindow for WaylandWindow {
+         let state = client.borrow();
+         state
+             .gpu_context
++            .context
+             .borrow()
+             .as_ref()
+             .is_some_and(|ctx| ctx.supports_dual_source_blending())
+@@ -2069,6 +2079,11 @@ impl PlatformWindow for WaylandWindow {
+             .clone()
+     }
+ 
++    fn external_compositor_registry(&self) -> Option<Rc<RefCell<ExternalCompositorRegistry>>> {
++        let state = self.borrow();
++        Some(Rc::clone(&state.external_compositors))
++    }
++
+     fn show_window_menu(&self, position: Point<Pixels>) {
+         let state = self.borrow();
+         let serial = state.client.get_serial(SerialKind::MousePress);
+diff --git a/crates/gpui_linux/src/linux/x11.rs b/crates/gpui_linux/src/linux/x11.rs
+index f9b9727..123c84f 100644
+--- a/crates/gpui_linux/src/linux/x11.rs
++++ b/crates/gpui_linux/src/linux/x11.rs
+@@ -2,6 +2,7 @@ mod client;
+ mod clipboard;
+ mod display;
+ mod event;
++mod scroll;
+ mod window;
+ mod xim_handler;
+ 
+diff --git a/crates/gpui_linux/src/linux/x11/client.rs b/crates/gpui_linux/src/linux/x11/client.rs
+index 601eb93..c07163d 100644
+--- a/crates/gpui_linux/src/linux/x11/client.rs
++++ b/crates/gpui_linux/src/linux/x11/client.rs
+@@ -45,7 +45,9 @@ use super::{
+     XimHandler, button_or_scroll_from_event_detail, check_reply,
+     clipboard::{self, Clipboard},
+     get_reply, get_valuator_axis_index, handle_connection_error, modifiers_from_state,
+-    pressed_button_from_mask, xcb_flush,
++    pressed_button_from_mask,
++    scroll::make_scroll_wheel_event,
++    xcb_flush,
+ };
+ 
+ use crate::linux::{
+@@ -62,8 +64,7 @@ use gpui::{
+     AnyWindowHandle, Bounds, ClipboardItem, CursorStyle, FileDropEvent, FrameRequestSource,
+     Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, Pixels, PlatformDisplay,
+     PlatformFrameSignal, PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point,
+-    RequestFrameOptions, ScrollDelta, Size, TouchPhase, WindowButtonLayout, WindowParams,
+-    WindowVisibility, point, px,
++    RequestFrameOptions, Size, WindowButtonLayout, WindowParams, WindowVisibility, point, px,
+ };
+ use gpui_wgpu::{CompositorGpuHint, GpuContext};
+ 
+@@ -161,6 +162,7 @@ pub struct Xdnd {
+ 
+ #[derive(Debug)]
+ struct PointerDeviceState {
++    precise_scroll: bool,
+     horizontal: ScrollAxisState,
+     vertical: ScrollAxisState,
+ }
+@@ -517,7 +519,7 @@ impl X11Connection {
+                 last_location: Point::new(px(0.0), px(0.0)),
+                 current_count: 0,
+                 pinch_scale: 1.0,
+-                gpu_context: Rc::new(RefCell::new(None)),
++                gpu_context: Rc::new(gpui_wgpu::SharedGpuContext::new()),
+                 compositor_gpu,
+                 scale_factor,
+ 
+@@ -1296,7 +1298,7 @@ impl X11Client {
+                                 ScrollDirection::Right => Point::new(-SCROLL_LINES, 0.0),
+                             };
+                             window.handle_input(PlatformInput::ScrollWheel(
+-                                make_scroll_wheel_event(position, scroll_delta, modifiers),
++                                make_scroll_wheel_event(position, scroll_delta, modifiers, false),
+                             ));
+                         }
+                     }
+@@ -1380,6 +1382,7 @@ impl X11Client {
+ 
+                 state = self.0.borrow_mut();
+                 if let Some(pointer) = state.pointer_device_states.get_mut(&event.sourceid) {
++                    let precise_scroll = pointer.precise_scroll;
+                     let scroll_delta = get_scroll_delta_and_update_state(pointer, &event);
+                     drop(state);
+                     if let Some(scroll_delta) = scroll_delta {
+@@ -1387,6 +1390,7 @@ impl X11Client {
+                             position,
+                             scroll_delta,
+                             modifiers,
++                            precise_scroll,
+                         )));
+                     }
+                 }
+@@ -2494,6 +2498,11 @@ fn current_pointer_device_states(
+                     Some((
+                         info.deviceid,
+                         PointerDeviceState {
++                            // XI 2.4 gesture capability identifies touchpads, including XWayland.
++                            precise_scroll: info
++                                .classes
++                                .iter()
++                                .any(|class| class.data.as_gesture().is_some()),
+                             horizontal: horizontal.unwrap_or_else(Default::default),
+                             vertical: vertical.unwrap_or_else(Default::default),
+                         },
+@@ -2568,28 +2577,6 @@ fn get_axis_scroll_delta_and_update_state(
+     }
+ }
+ 
+-fn make_scroll_wheel_event(
+-    position: Point<Pixels>,
+-    scroll_delta: Point<f32>,
+-    modifiers: Modifiers,
+-) -> gpui::ScrollWheelEvent {
+-    // When shift is held down, vertical scrolling turns into horizontal scrolling.
+-    let delta = if modifiers.shift {
+-        Point {
+-            x: scroll_delta.y,
+-            y: 0.0,
+-        }
+-    } else {
+-        scroll_delta
+-    };
+-    gpui::ScrollWheelEvent {
+-        position,
+-        delta: ScrollDelta::Lines(delta),
+-        modifiers,
+-        touch_phase: TouchPhase::default(),
+-    }
+-}
+-
+ fn create_invisible_cursor(
+     connection: &XCBConnection,
+ ) -> anyhow::Result<crate::linux::x11::client::xproto::Cursor> {
+diff --git a/crates/gpui_linux/src/linux/x11/scroll.rs b/crates/gpui_linux/src/linux/x11/scroll.rs
+new file mode 100644
+index 0000000..688368f
+--- /dev/null
++++ b/crates/gpui_linux/src/linux/x11/scroll.rs
+@@ -0,0 +1,61 @@
++use gpui::{Modifiers, Pixels, Point, ScrollDelta, ScrollWheelEvent, point, px};
++
++pub(super) fn make_scroll_wheel_event(
++    position: Point<Pixels>,
++    scroll_delta: Point<f32>,
++    modifiers: Modifiers,
++    precise: bool,
++) -> ScrollWheelEvent {
++    let delta = if modifiers.shift {
++        point(scroll_delta.y, 0.0)
++    } else {
++        scroll_delta
++    };
++    let delta = if precise {
++        // XInput normalizes scroll valuators to lines; expose touchpad movement as logical pixels.
++        ScrollDelta::Pixels(point(px(delta.x * 32.0), px(delta.y * 32.0)))
++    } else {
++        ScrollDelta::Lines(delta)
++    };
++    ScrollWheelEvent {
++        position,
++        delta,
++        modifiers,
++        touch_phase: Default::default(),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn trackpad_is_precise_and_mouse_wheel_remains_lines() {
++        for precise in [false, true] {
++            let event = make_scroll_wheel_event(
++                point(px(80.0), px(60.0)),
++                point(0.5, -0.25),
++                Modifiers::default(),
++                precise,
++            );
++            assert_eq!(event.delta.precise(), precise);
++            assert_eq!(event.delta.pixel_delta(px(32.0)), point(px(16.0), px(-8.0)));
++        }
++    }
++
++    #[test]
++    fn shift_preserves_horizontal_scroll_mapping() {
++        for precise in [false, true] {
++            let event = make_scroll_wheel_event(
++                Point::default(),
++                point(0.0, -0.25),
++                Modifiers {
++                    shift: true,
++                    ..Default::default()
++                },
++                precise,
++            );
++            assert_eq!(event.delta.pixel_delta(px(32.0)), point(px(-8.0), px(0.0)));
++        }
++    }
++}
+diff --git a/crates/gpui_linux/src/linux/x11/window.rs b/crates/gpui_linux/src/linux/x11/window.rs
+index f6ee76a..e9ecaac 100644
+--- a/crates/gpui_linux/src/linux/x11/window.rs
++++ b/crates/gpui_linux/src/linux/x11/window.rs
+@@ -3,12 +3,12 @@ use x11rb::connection::RequestConnection;
+ 
+ use crate::linux::X11ClientStatePtr;
+ use gpui::{
+-    AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
+-    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
+-    Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, Size,
+-    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+-    WindowDecorations, WindowKind, WindowParams, WindowVisibility, popup::PopupNotSupportedError,
+-    px,
++    AnyWindowHandle, Bounds, Decorations, DevicePixels, ExternalCompositorRegistry,
++    ForegroundExecutor, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
++    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
++    ResizeEdge, ScaledPixels, Scene, Size, Tiling, WindowAppearance, WindowBackgroundAppearance,
++    WindowBounds, WindowControlArea, WindowDecorations, WindowKind, WindowParams, WindowVisibility,
++    popup::PopupNotSupportedError, px,
+ };
+ use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
+ 
+@@ -272,6 +272,7 @@ pub struct X11WindowState {
+     /// Taken when the window is dropped. Its GPU objects use the X connection, so they mustn't
+     /// outlive the window, which a display mode switch relies on.
+     renderer: Option<WgpuRenderer>,
++    external_compositors: Rc<RefCell<ExternalCompositorRegistry>>,
+     display: Rc<dyn PlatformDisplay>,
+     input_handler: Option<PlatformInputHandler>,
+     appearance: WindowAppearance,
+@@ -756,6 +757,7 @@ impl X11WindowState {
+ 
+             xcb_flush(xcb);
+ 
++            let external_compositors = Rc::new(RefCell::new(ExternalCompositorRegistry::new()));
+             let mut renderer = {
+                 let raw_window = RawWindow {
+                     connection: as_raw_xcb_connection::AsRawXcbConnection::as_raw_xcb_connection(
+@@ -776,7 +778,13 @@ impl X11WindowState {
+                     transparent: false,
+                     preferred_present_mode: None,
+                 };
+-                WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?
++                WgpuRenderer::new(
++                    gpu_context,
++                    &raw_window,
++                    config,
++                    compositor_gpu,
++                    Some(Rc::clone(&external_compositors)),
++                )?
+             };
+ 
+             renderer.set_subpixel_layout(is_bgr);
+@@ -837,6 +845,7 @@ impl X11WindowState {
+                 bounds: bounds.to_pixels(scale_factor),
+                 scale_factor,
+                 renderer: Some(renderer),
++                external_compositors,
+                 atoms: *atoms,
+                 input_handler: None,
+                 active: false,
+@@ -1643,6 +1652,7 @@ impl PlatformWindow for X11Window {
+                 let state = ref_cell.borrow();
+                 state
+                     .gpu_context
++                    .context
+                     .borrow()
+                     .as_ref()
+                     .is_some_and(|ctx| ctx.supports_dual_source_blending())
+@@ -1793,6 +1803,11 @@ impl PlatformWindow for X11Window {
+             .clone()
+     }
+ 
++    fn external_compositor_registry(&self) -> Option<Rc<RefCell<ExternalCompositorRegistry>>> {
++        let inner = self.0.state.borrow();
++        Some(Rc::clone(&inner.external_compositors))
++    }
++
+     fn show_window_menu(&self, position: Point<Pixels>) {
+         let state = self.0.state.borrow();
+ 
+diff --git a/crates/gpui_wgpu/Cargo.toml b/crates/gpui_wgpu/Cargo.toml
+index 179b134..9c8c6bc 100644
+--- a/crates/gpui_wgpu/Cargo.toml
++++ b/crates/gpui_wgpu/Cargo.toml
+@@ -55,7 +55,7 @@ wgpu = { workspace = true, features = ["webgl"] }
+ criterion.workspace = true
+ gpui = { workspace = true, features = ["bench-support"] }
+ image.workspace = true
+-naga = { version = "29.0.4", features = ["wgsl-in"] }
++naga = { version = "=30.0.1", features = ["wgsl-in"] }
+ 
+ [[bench]]
+ name = "layout_line"
+diff --git a/crates/gpui_wgpu/src/external_compositor.wgsl b/crates/gpui_wgpu/src/external_compositor.wgsl
+new file mode 100644
+index 0000000..2f4ed1c
+--- /dev/null
++++ b/crates/gpui_wgpu/src/external_compositor.wgsl
+@@ -0,0 +1,52 @@
++// --- external compositors --- //
++
++struct ExternalCompositorInstance {
++    bounds: Bounds,
++    content_mask: Bounds,
++    alpha_premultiplied: u32,
++    pad0: u32,
++    pad1: u32,
++    pad2: u32,
++}
++
++// Uses the current instance layout in group 1 and texture/sampler in group 2,
++// with one instance per draw call.
++@group(1) @binding(0) var<storage, read> b_external_compositors: array<ExternalCompositorInstance>;
++
++struct ExternalCompositorVarying {
++    @builtin(position) position: vec4<f32>,
++    @location(0) texture_position: vec2<f32>,
++    @location(1) @interpolate(flat) instance_id: u32,
++    @location(3) clip_distances: vec4<f32>,
++}
++
++@vertex
++fn vs_external_compositor(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> ExternalCompositorVarying {
++    let instance = b_external_compositors[instance_id];
++    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
++
++    var out = ExternalCompositorVarying();
++    out.position = to_device_position(unit_vertex, instance.bounds);
++    out.texture_position = unit_vertex;
++    out.instance_id = instance_id;
++    out.clip_distances = distance_from_clip_rect(unit_vertex, instance.bounds, instance.content_mask);
++    return out;
++}
++
++@fragment
++fn fs_external_compositor(input: ExternalCompositorVarying) -> @location(0) vec4<f32> {
++    // Sample before the (potential) early-out below: derivative-based texture
++    // sampling must stay in uniform control flow, same as fs_poly_sprite/fs_mono_sprite.
++    let c = textureSample(t_sprite, s_sprite, input.texture_position);
++
++    // Alpha clip after using the derivatives.
++    if (any(input.clip_distances < vec4<f32>(0.0))) {
++        return vec4<f32>(0.0);
++    }
++
++    let instance = b_external_compositors[input.instance_id];
++    if (instance.alpha_premultiplied == 0u) {
++        return vec4<f32>(c.rgb * c.a, c.a);
++    }
++    return c;
++}
+diff --git a/crates/gpui_wgpu/src/gpui_wgpu.rs b/crates/gpui_wgpu/src/gpui_wgpu.rs
+index 29a79af..73437a8 100644
+--- a/crates/gpui_wgpu/src/gpui_wgpu.rs
++++ b/crates/gpui_wgpu/src/gpui_wgpu.rs
+@@ -12,4 +12,8 @@ pub use wgpu_context::*;
+     any(test, feature = "bench-support", feature = "test-support")
+ ))]
+ pub use wgpu_renderer::WgpuHeadlessRenderer;
++pub use wgpu_renderer::{
++    ExternalComposeOutput, SharedGpuContext, WgpuCompositorBackendCtx, WgpuExternalCompositor,
++    register_external_compositor,
++};
+ pub use wgpu_renderer::{GpuContext, WgpuRenderer, WgpuSurfaceConfig};
+diff --git a/crates/gpui_wgpu/src/wgpu_context.rs b/crates/gpui_wgpu/src/wgpu_context.rs
+index 4c55ef1..da04848 100644
+--- a/crates/gpui_wgpu/src/wgpu_context.rs
++++ b/crates/gpui_wgpu/src/wgpu_context.rs
+@@ -55,6 +55,10 @@ impl DeviceErrorState {
+         self.lost.load(Ordering::Relaxed)
+     }
+ 
++    pub(crate) fn request_recovery(&self) {
++        self.lost.store(true, Ordering::Relaxed);
++    }
++
+     fn record(&self, error: String) {
+         let mut last_error = self.last_error.lock();
+         last_error.0 = last_error.0.wrapping_add(1);
+@@ -664,6 +668,7 @@ impl WgpuContext {
+             desired_maximum_frame_latency: 2,
+             alpha_mode: caps.alpha_modes[0],
+             view_formats: vec![],
++            color_space: Default::default(),
+         };
+ 
+         surface.configure(&device, &test_config);
+diff --git a/crates/gpui_wgpu/src/wgpu_renderer.rs b/crates/gpui_wgpu/src/wgpu_renderer.rs
+index 8387528..691eccf 100644
+--- a/crates/gpui_wgpu/src/wgpu_renderer.rs
++++ b/crates/gpui_wgpu/src/wgpu_renderer.rs
+@@ -3,18 +3,22 @@ use anyhow::{Context as _, Result};
+ use bytemuck::{Pod, Zeroable};
+ use collections::FxHashMap;
+ use gpui::{
+-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
+-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
++    AlphaMode, AtlasTextureId, Background, Bounds, DevicePixels, ExternalCompositorError,
++    ExternalCompositorPrimitive, ExternalCompositorRegistry, ExternalSlotDescriptor,
++    ExternalSlotHandle, GpuSpecs, Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size,
++    get_gamma_correction_ratios,
+ };
+ use log::warn;
+ #[cfg(not(target_family = "wasm"))]
+ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+ use smallvec::SmallVec;
++use std::any::Any;
+ use std::cell::RefCell;
+ use std::num::NonZeroU64;
+ use std::ops::Range;
+ use std::rc::Rc;
+ use std::sync::Arc;
++use std::sync::atomic::{AtomicU64, Ordering};
+ 
+ const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
+ 
+@@ -86,6 +90,128 @@ struct SurfaceParams {
+     content_mask: PodBounds,
+ }
+ 
++/// Per-draw instance data for an external compositor primitive. Written to the same
++/// `instance_buffer` storage buffer used by mono/poly sprites and paths (see
++/// `WgpuRenderer::draw_instances_with_texture`), one instance per draw call: unlike
++/// sprites, each external compositor primitive has its own texture view, so there is
++/// no batching across primitives.
++#[repr(C)]
++#[derive(Clone, Copy, Pod, Zeroable)]
++struct ExternalCompositorInstanceGpu {
++    bounds: PodBounds,
++    content_mask: PodBounds,
++    /// Non-zero if the source texture's color channels are already multiplied by
++    /// alpha (see `gpui::AlphaMode`); the fragment shader premultiplies otherwise.
++    alpha_premultiplied: u32,
++    pad: [u32; 3],
++}
++
++/// Outcome of a single [`WgpuExternalCompositor::compose`] call.
++#[derive(Clone, Debug)]
++pub enum ExternalComposeOutput {
++    /// A frame is ready this call and should be drawn into the slot's bounds.
++    Ready {
++        /// The view containing this frame's composited content.
++        view: Arc<wgpu::TextureView>,
++    },
++    /// No frame is ready yet; the backend draws the slot's fallback color (if any)
++    /// instead.
++    NotReady,
++    /// The graphics context was lost. The caller should invalidate the slot and
++    /// schedule device recovery.
++    ContextLost,
++}
++
++/// Implemented by an external, backend-specific renderer (e.g. a wgpu-based 3D
++/// renderer) that composites into a slot registered with a
++/// [`ExternalCompositorRegistry`] via [`register_external_compositor`].
++///
++/// This trait has no `Send` bound: implementors live on the window's event loop
++/// thread, alongside the [`ExternalCompositorRegistry`], which is shared as
++/// `Rc<RefCell<_>>`.
++///
++/// Unlike the backend-neutral `gpui` core (which stores a slot's compositor as an
++/// opaque `Box<dyn Any>`), this trait's `compose` method takes a concretely-typed,
++/// genuinely lifetime-scoped `&mut WgpuCompositorBackendCtx<'_>` — no `unsafe`
++/// lifetime erasure is involved anywhere in this path (see
++/// `WgpuRenderer::compose_external_compositors`).
++pub trait WgpuExternalCompositor: 'static {
++    /// Called by the backend at a controlled point in the frame (with a live GPU
++    /// command encoder in hand, before the frame is submitted).
++    fn compose(
++        &mut self,
++        slot: ExternalSlotHandle,
++        ctx: &mut WgpuCompositorBackendCtx<'_>,
++    ) -> ExternalComposeOutput;
++
++    /// Called after the graphics context has been recreated (e.g. device-lost
++    /// recovery), once per real device recreation, for every slot that was occupied
++    /// at the time (see `WgpuRenderer::recover`). The handle this compositor was
++    /// registered under is now stale (see
++    /// [`ExternalCompositorRegistry::is_valid`]); the implementor should drop GPU
++    /// resources tied to the old context. The default implementation does nothing.
++    fn on_context_recreated(&mut self, _new_generation: u64) {}
++}
++
++/// Registers `compositor` with `registry`, double-boxing it into the
++/// `Box<dyn Any>` the backend-neutral [`ExternalCompositorRegistry`] stores slot
++/// compositors as: `Box::new(Box::new(compositor) as Box<dyn WgpuExternalCompositor>)
++/// as Box<dyn Any>`. A single `downcast_mut::<Box<dyn WgpuExternalCompositor>>()`
++/// (see `WgpuRenderer::compose_external_compositors`) then recovers a concrete trait
++/// object, without ever needing to erase the non-`'static` lifetimes
++/// [`WgpuCompositorBackendCtx`] carries (e.g. its frame-scoped `encoder`) through
++/// `Any`.
++pub fn register_external_compositor(
++    registry: &Rc<RefCell<ExternalCompositorRegistry>>,
++    descriptor: ExternalSlotDescriptor,
++    compositor: impl WgpuExternalCompositor,
++) -> Result<ExternalSlotHandle, ExternalCompositorError> {
++    let boxed: Box<dyn WgpuExternalCompositor> = Box::new(compositor);
++    let double_boxed: Box<dyn Any> = Box::new(boxed);
++    registry.borrow_mut().register(descriptor, double_boxed)
++}
++
++/// Backend-specific context handed to [`WgpuExternalCompositor::compose`] by this
++/// wgpu render backend. Every field here is either an owned `Arc` clone or a
++/// genuine, non-`'static` borrow scoped to the `compose` call it was created for:
++/// there is no `dyn Any` involved on this path (that erasure only happens once,
++/// around the *outer* `Box<dyn WgpuExternalCompositor>` stored in the registry —
++/// see [`register_external_compositor`]), so `'a` is a real lifetime the compiler
++/// enforces, not merely a documented contract.
++pub struct WgpuCompositorBackendCtx<'a> {
++    /// The shared wgpu device. Compositors may use this to create textures, buffers,
++    /// or pipelines tied to the same device as the rest of the frame. An `Arc` clone
++    /// (not a borrow) so that holding onto it beyond `compose` is safe, even though
++    /// doing so is not the intended usage.
++    pub device: Arc<wgpu::Device>,
++    /// The shared wgpu queue, e.g. for uploads outside of `encoder`. An `Arc` clone,
++    /// for the same reason as `device`.
++    pub queue: Arc<wgpu::Queue>,
++    /// The command encoder for the frame currently being drawn. Compositors that
++    /// need to record GPU work ahead of composition (e.g. rendering into their own
++    /// offscreen texture) can do so here, so that work lands in the same submission
++    /// as the rest of the frame. Unlike `device`/`queue`, this is a genuine
++    /// frame-scoped borrow: do not retain it past `compose`.
++    pub encoder: &'a mut wgpu::CommandEncoder,
++    /// The renderer's current graphics context generation (see
++    /// [`ExternalCompositorRegistry::current_context_generation`] and
++    /// [`GpuContext`]/`SharedGpuContext`, which is this value's single source of
++    /// truth across every window sharing the same device). Compositors compare this
++    /// against the generation they last registered under to detect that they must
++    /// re-register (see [`WgpuExternalCompositor::on_context_recreated`]).
++    pub context_generation: u64,
++    /// A backend-local, monotonically increasing frame index, incremented once per
++    /// `WgpuRenderer::draw` call. This is *not* the same counter as
++    /// [`gpui::Window::frame_counter`]; it exists purely for the compositor's own
++    /// bookkeeping (e.g. resource aging, throttling). The registry's frame-in-flight
++    /// tracking does not depend on it (see [`ExternalCompositorRegistry::mark_processed`]).
++    pub frame_index: u64,
++    /// The pixel format of the window's swapchain surface. Informational only:
++    /// composited views are sampled (not rendered into) by this backend, so they
++    /// need not match this format.
++    pub target_format: wgpu::TextureFormat,
++}
++
+ #[repr(C)]
+ #[derive(Clone, Copy, Pod, Zeroable)]
+ struct GammaParams {
+@@ -102,6 +228,20 @@ struct PathSprite {
+     bounds: Bounds<ScaledPixels>,
+ }
+ 
++enum ComposeOutcome {
++    /// A frame was ready this call; every primitive referencing this handle draws
++    /// the same view.
++    Ready {
++        view: Arc<wgpu::TextureView>,
++        alpha_premultiplied: bool,
++    },
++    /// No frame ready, the slot is unknown/stale, or composing it failed in some
++    /// other recoverable way (see `WgpuRenderer::compose_one_external_compositor`):
++    /// nothing to draw for this handle. The element's own background (if any, see
++    /// `gpui::elements::ExternalCompositorElement::background`) stays visible.
++    Skipped,
++}
++
+ #[derive(Clone, Debug)]
+ #[repr(C)]
+ struct PathRasterizationVertex {
+@@ -134,6 +274,7 @@ struct WgpuPipelines {
+     poly_sprites: wgpu::RenderPipeline,
+     #[allow(dead_code)]
+     surfaces: wgpu::RenderPipeline,
++    external_compositors: Option<wgpu::RenderPipeline>,
+ }
+ 
+ /// One frame allocation of instance data, ready to bind.
+@@ -164,7 +305,39 @@ struct WgpuBindGroupLayouts {
+ }
+ 
+ /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
+-pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
++pub struct SharedGpuContext {
++    /// The shared `wgpu` context, if one has been created yet (and hasn't been torn
++    /// down for recovery).
++    pub context: RefCell<Option<WgpuContext>>,
++    /// Monotonically increasing graphics context generation, bumped exactly once per
++    /// *actual* context recreation (not merely reattaching an already-recovered
++    /// context to another window's surface). Starts at `1`, matching the convention
++    /// [`ExternalCompositorRegistry::current_context_generation`] and
++    /// `ExternalSlotDescriptor::context_generation` also use (generation `0` is
++    /// reserved elsewhere to mean "invalid").
++    pub generation: AtomicU64,
++}
++
++impl SharedGpuContext {
++    /// Creates fresh, empty shared context state (no `wgpu` context yet, generation
++    /// `1`).
++    pub fn new() -> Self {
++        Self {
++            context: RefCell::new(None),
++            generation: AtomicU64::new(1),
++        }
++    }
++}
++
++impl Default for SharedGpuContext {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++/// Shared GPU context reference, used to coordinate device recovery — and
++/// external-compositor context-generation bookkeeping — across multiple windows.
++pub type GpuContext = Rc<SharedGpuContext>;
+ 
+ enum InstanceData {
+     Storage(wgpu::Buffer),
+@@ -211,6 +384,9 @@ impl WgpuResources {
+ }
+ 
+ struct WgpuRendererCore {
++    shared_context: Option<GpuContext>,
++    external_compositors: Option<Rc<RefCell<ExternalCompositorRegistry>>>,
++    frame_index: u64,
+     resources: WgpuResources,
+     atlas: Arc<WgpuAtlas>,
+     path_globals_offset: u64,
+@@ -294,6 +470,7 @@ impl WgpuRenderer {
+         window: &W,
+         config: WgpuSurfaceConfig,
+         compositor_gpu: Option<CompositorGpuHint>,
++        external_compositors: Option<Rc<RefCell<ExternalCompositorRegistry>>>,
+     ) -> anyhow::Result<Self>
+     where
+         W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
+@@ -312,6 +489,7 @@ impl WgpuRenderer {
+         // The surface must be created with the same instance that will be used for
+         // adapter selection, otherwise wgpu will panic.
+         let instance = gpu_context
++            .context
+             .borrow()
+             .as_ref()
+             .map(|ctx| ctx.instance.clone())
+@@ -326,7 +504,7 @@ impl WgpuRenderer {
+                 .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))?
+         };
+ 
+-        let mut ctx_ref = gpu_context.borrow_mut();
++        let mut ctx_ref = gpu_context.context.borrow_mut();
+         let context = match ctx_ref.as_mut() {
+             Some(context) => {
+                 context.check_compatible_with_surface(&surface)?;
+@@ -337,14 +515,23 @@ impl WgpuRenderer {
+ 
+         let atlas = Arc::new(WgpuAtlas::from_context(context));
+ 
+-        Self::new_internal(
++        let mut renderer = Self::new_internal(
+             Some(Rc::clone(&gpu_context)),
+             context,
+             surface,
+             config,
+             compositor_gpu,
+             atlas,
+-        )
++        )?;
++        let generation = gpu_context.generation.load(Ordering::SeqCst);
++        if let Some(registry) = &external_compositors {
++            registry.borrow_mut().on_context_recreated(generation);
++        }
++        if let Some(core) = renderer.core_mut() {
++            core.shared_context = Some(Rc::clone(&gpu_context));
++            core.external_compositors = external_compositors;
++        }
++        Ok(renderer)
+     }
+ 
+     #[cfg(target_family = "wasm")]
+@@ -456,6 +643,7 @@ impl WgpuRenderer {
+             desired_maximum_frame_latency: 2,
+             alpha_mode,
+             view_formats: vec![],
++            color_space: Default::default(),
+         };
+         // Configure the surface immediately. The adapter selection process already validated
+         // that this adapter can successfully configure this surface.
+@@ -917,6 +1105,37 @@ impl WgpuRendererCore {
+             &shader_module,
+         );
+ 
++        let external_compositors = if uses_webgl_instance_data {
++            None
++        } else {
++            let external_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
++                label: Some("external_compositor_shader"),
++                source: wgpu::ShaderSource::Wgsl(
++                    concat!(
++                        include_str!("shaders.wgsl"),
++                        include_str!("shaders_storage.wgsl"),
++                        include_str!("external_compositor.wgsl")
++                    )
++                    .into(),
++                ),
++            });
++            Some(create_pipeline(
++                "external_compositors",
++                "vs_external_compositor",
++                "fs_external_compositor",
++                &layouts.globals,
++                &layouts.instances,
++                Some(&layouts.texture),
++                wgpu::PrimitiveTopology::TriangleStrip,
++                &[Some(wgpu::ColorTargetState {
++                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
++                    ..color_target.clone()
++                })],
++                1,
++                &external_shader,
++            ))
++        };
++
+         let surfaces = create_pipeline(
+             "surfaces",
+             "vs_surface",
+@@ -940,6 +1159,7 @@ impl WgpuRendererCore {
+             subpixel_sprites,
+             poly_sprites,
+             surfaces,
++            external_compositors,
+         }
+     }
+ 
+@@ -1207,7 +1427,7 @@ impl WgpuRenderer {
+             return false;
+         }
+ 
+-        frame.present();
++        core.resources.queue.present(frame);
+         true
+     }
+ }
+@@ -1338,6 +1558,9 @@ impl WgpuRendererCore {
+         let max_texture_size = device.limits().max_texture_dimension_2d;
+ 
+         Self {
++            shared_context: None,
++            external_compositors: None,
++            frame_index: 0,
+             resources: WgpuResources {
+                 device,
+                 queue,
+@@ -1505,6 +1728,13 @@ impl WgpuRendererCore {
+                     label: Some("main_encoder"),
+                 });
+ 
++        self.frame_index = self.frame_index.wrapping_add(1);
++        let external_outcomes = if let Some(registry) = &self.external_compositors {
++            self.compose_external_compositors(&scene.external_compositors, registry, &mut encoder)
++        } else {
++            FxHashMap::default()
++        };
++
+         {
+             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                 label: Some("main_pass"),
+@@ -1611,6 +1841,36 @@ impl WgpuRendererCore {
+                     }
+                     // Surfaces are macOS-only for video playback and are not
+                     // implemented by the WGPU renderer.
++                    PrimitiveBatch::ExternalCompositors(range) => {
++                        for primitive in &scene.external_compositors[range] {
++                            let Some(ComposeOutcome::Ready {
++                                view,
++                                alpha_premultiplied,
++                            }) = external_outcomes.get(&primitive.handle)
++                            else {
++                                continue;
++                            };
++                            let data = ExternalCompositorInstanceGpu {
++                                bounds: primitive.bounds.into(),
++                                content_mask: primitive.content_mask.bounds.into(),
++                                alpha_premultiplied: u32::from(*alpha_premultiplied),
++                                pad: [0; 3],
++                            };
++                            let binding = self.write_instance_binding(
++                                "external_instance",
++                                &mut instance_offset,
++                                &[data],
++                            )?;
++                            let texture = self.create_texture_bind_group("external_texture", view);
++                            if let Some(pipeline) = &self.resources.pipelines.external_compositors {
++                                pass.set_pipeline(pipeline);
++                                pass.set_bind_group(0, &self.resources.globals_bind_group, &[]);
++                                pass.set_bind_group(1, &binding.bind_group, &[]);
++                                pass.set_bind_group(2, &texture, &[]);
++                                pass.draw(0..4, binding.first_instance..binding.first_instance + 1);
++                            }
++                        }
++                    }
+                     PrimitiveBatch::Surfaces(_surfaces) => {}
+                 }
+             }
+@@ -1620,9 +1880,159 @@ impl WgpuRendererCore {
+             .resources()
+             .queue
+             .submit(std::iter::once(encoder.finish()));
++        if let Some(registry) = &self.external_compositors {
++            let mut registry = registry.borrow_mut();
++            registry.mark_frame_submitted();
++        }
+         Ok(submission)
+     }
+ 
++    fn compose_external_compositors(
++        &self,
++        externals: &[ExternalCompositorPrimitive],
++        registry: &Rc<RefCell<ExternalCompositorRegistry>>,
++        encoder: &mut wgpu::CommandEncoder,
++    ) -> FxHashMap<ExternalSlotHandle, ComposeOutcome> {
++        let resources = self.resources();
++        let device = Arc::clone(&resources.device);
++        let queue = Arc::clone(&resources.queue);
++        let target_format = self.target_format;
++        let context_generation = self
++            .shared_context
++            .as_ref()
++            .map_or(1, |shared| shared.generation.load(Ordering::SeqCst));
++
++        let mut outcomes = FxHashMap::default();
++        for primitive in externals {
++            let handle = primitive.handle;
++            if outcomes.contains_key(&handle) {
++                // Already composed this frame — see this method's docs.
++                continue;
++            }
++            let outcome = self.compose_one_external_compositor(
++                handle,
++                registry,
++                &device,
++                &queue,
++                target_format,
++                context_generation,
++                encoder,
++            );
++            outcomes.insert(handle, outcome);
++        }
++        outcomes
++    }
++
++    /// Composes a single slot for [`Self::compose_external_compositors`]. Every
++    /// return path is a slot the caller must call
++    /// [`ExternalCompositorRegistry::mark_processed`] for once composing (this
++    /// method) is done and the frame that did so has actually landed on the queue
++    /// (see `Self::draw`) — `ComposeOutcome::Skipped` covers every way that can
++    /// happen short of a `Ready` frame (unknown/freed handle, stale context
++    /// generation, a compositor that isn't a `Box<dyn WgpuExternalCompositor>`,
++    /// `NotReady`, and `ContextLost`).
++    fn compose_one_external_compositor(
++        &self,
++        handle: ExternalSlotHandle,
++        registry: &Rc<RefCell<ExternalCompositorRegistry>>,
++        device: &Arc<wgpu::Device>,
++        queue: &Arc<wgpu::Queue>,
++        target_format: wgpu::TextureFormat,
++        context_generation: u64,
++        encoder: &mut wgpu::CommandEncoder,
++    ) -> ComposeOutcome {
++        // A slot's descriptor records the graphics context generation it was
++        // registered under. If that no longer matches this renderer's current
++        // generation, the slot's (and its compositor's) GPU resources belong to a
++        // context that no longer exists (see `Self::recover`): skip composing it
++        // this frame without calling `compose` at all. The compositor was already
++        // notified of the recreation via `WgpuExternalCompositor::on_context_recreated`
++        // as part of `recover`'s post-recreation walk; it's up to the app to
++        // unregister the stale handle (see `ExternalCompositorRegistry::is_valid`)
++        // and register a fresh one. This is *not* treated as a fresh device-loss
++        // signal (unlike a `ContextLost` result from `compose` itself): the device
++        // is fine, this slot is simply waiting on the app to catch up.
++        let Some(descriptor_generation) = registry
++            .borrow()
++            .descriptor(handle)
++            .map(|descriptor| descriptor.context_generation)
++        else {
++            // Unknown/fully-freed handle. Nothing to compose; the element's own
++            // background (if any) shows through this frame's `Load` pass.
++            return ComposeOutcome::Skipped;
++        };
++        if descriptor_generation != context_generation {
++            log::debug!(
++                "external compositor slot {handle:?} belongs to graphics context \
++                 generation {descriptor_generation}, current is {context_generation}; \
++                 skipping composition until the app re-registers"
++            );
++            return ComposeOutcome::Skipped;
++        }
++
++        let Some(mut boxed) = registry.borrow_mut().take_compositor(handle) else {
++            return ComposeOutcome::Skipped;
++        };
++        let Some(compositor) = boxed.downcast_mut::<Box<dyn WgpuExternalCompositor>>() else {
++            log::warn!(
++                "external compositor slot {handle:?} holds a compositor that isn't a \
++                 `Box<dyn WgpuExternalCompositor>`; skipping its draw this frame"
++            );
++            registry.borrow_mut().put_back_compositor(handle, boxed);
++            return ComposeOutcome::Skipped;
++        };
++
++        let mut ctx = WgpuCompositorBackendCtx {
++            device: Arc::clone(device),
++            queue: Arc::clone(queue),
++            encoder,
++            context_generation,
++            frame_index: self.frame_index,
++            target_format,
++        };
++        let result = compositor.compose(handle, &mut ctx);
++        // Always put the compositor back, even on error/NotReady: the take-out
++        // dance only exists to avoid re-entrant borrows of `registry` while
++        // `compose` runs, not to permanently remove it.
++        registry.borrow_mut().put_back_compositor(handle, boxed);
++
++        match result {
++            ExternalComposeOutput::Ready { view } => {
++                let alpha_premultiplied = registry
++                    .borrow()
++                    .descriptor(handle)
++                    .map(|descriptor| descriptor.alpha_mode == AlphaMode::PreMultiplied)
++                    .unwrap_or(true);
++                ComposeOutcome::Ready {
++                    view,
++                    alpha_premultiplied,
++                }
++            }
++            ExternalComposeOutput::NotReady => {
++                // Nothing composed this frame; leave the background (if any) up.
++                ComposeOutcome::Skipped
++            }
++            ExternalComposeOutput::ContextLost => {
++                log::warn!(
++                    "external compositor slot {handle:?} reported a lost graphics \
++                     context; scheduling device recovery"
++                );
++                // Reuse the same recovery path `draw()`'s own GPU errors already
++                // drive: platforms poll `device_lost()` every frame and call
++                // `recover()` when it flips true. The whole frame is already doomed
++                // if the device is truly lost; the existing device-lost machinery
++                // recovers before the next draw; aborting mid-frame here would
++                // complicate the retry contract for no user-visible gain.
++                if let Some(shared) = &self.shared_context {
++                    if let Some(context) = shared.context.borrow().as_ref() {
++                        context.errors().request_recovery();
++                    }
++                }
++                ComposeOutcome::Skipped
++            }
++        }
++    }
++
+     fn write_instances(
+         &mut self,
+         scene: &Scene,
+@@ -2215,7 +2625,11 @@ impl WgpuRenderer {
+         let gpu_context = self.context.as_ref().expect("recover requires gpu_context");
+ 
+         // Check if another window already recovered the context
++        let external_compositors = self
++            .core()
++            .and_then(|core| core.external_compositors.clone());
+         let needs_new_context = gpu_context
++            .context
+             .borrow()
+             .as_ref()
+             .is_none_or(|ctx| ctx.device_lost());
+@@ -2229,7 +2643,7 @@ impl WgpuRenderer {
+ 
+             // Drop old resources to release Arc<Device>/Arc<Queue> and GPU resources
+             self.state = RendererState::Released;
+-            *gpu_context.borrow_mut() = None;
++            *gpu_context.context.borrow_mut() = None;
+ 
+             // Wait briefly for the GPU driver to stabilize, then try to
+             // recreate the context without software renderers. If this fails
+@@ -2241,10 +2655,11 @@ impl WgpuRenderer {
+             let surface = create_surface(&instance, window_handle.as_raw())?;
+             let new_context =
+                 WgpuContext::new_rejecting_software(instance, &surface, self.compositor_gpu)?;
+-            *gpu_context.borrow_mut() = Some(new_context);
++            *gpu_context.context.borrow_mut() = Some(new_context);
++            gpu_context.generation.fetch_add(1, Ordering::SeqCst);
+             surface
+         } else {
+-            let ctx_ref = gpu_context.borrow();
++            let ctx_ref = gpu_context.context.borrow();
+             let instance = &ctx_ref.as_ref().unwrap().instance;
+             create_surface(instance, window_handle.as_raw())?
+         };
+@@ -2258,7 +2673,7 @@ impl WgpuRenderer {
+             preferred_present_mode: Some(self.surface_config.present_mode),
+         };
+         let gpu_context = Rc::clone(gpu_context);
+-        let ctx_ref = gpu_context.borrow();
++        let ctx_ref = gpu_context.context.borrow();
+         let context = ctx_ref.as_ref().expect("context should exist");
+ 
+         self.state = RendererState::Released;
+@@ -2274,6 +2689,26 @@ impl WgpuRenderer {
+             self.atlas.clone(),
+         )?;
+         self.set_subpixel_layout(is_bgr);
++        let generation = gpu_context.generation.load(Ordering::SeqCst);
++        if let Some(registry) = &external_compositors {
++            registry.borrow_mut().on_context_recreated(generation);
++            let handles: Vec<_> = registry.borrow().occupied_handles().collect();
++            for handle in handles {
++                let boxed = registry.borrow_mut().take_compositor(handle);
++                if let Some(mut boxed) = boxed {
++                    if let Some(compositor) =
++                        boxed.downcast_mut::<Box<dyn WgpuExternalCompositor>>()
++                    {
++                        compositor.on_context_recreated(generation);
++                    }
++                    registry.borrow_mut().put_back_compositor(handle, boxed);
++                }
++            }
++        }
++        if let Some(core) = self.core_mut() {
++            core.shared_context = Some(Rc::clone(&gpu_context));
++            core.external_compositors = external_compositors;
++        }
+ 
+         log::info!("GPU recovery complete");
+         Ok(())
+diff --git a/crates/gpui_windows/src/directx_renderer.rs b/crates/gpui_windows/src/directx_renderer.rs
+index f8b86bc..3332292 100644
+--- a/crates/gpui_windows/src/directx_renderer.rs
++++ b/crates/gpui_windows/src/directx_renderer.rs
+@@ -385,6 +385,9 @@ impl DirectXRenderer {
+                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
+                 }
+                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
++                // External composition is only implemented in the wgpu backend;
++                // the element's fallback quad covers this arm.
++                PrimitiveBatch::ExternalCompositors(_) => Ok(()),
+             }
+             .with_context(|| {
+                 format!(

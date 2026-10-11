@@ -1,0 +1,19 @@
+# Upstream commits verified on 2026-10-11.
+# GPUI compositor adapted from 0xCarbon/zed commit
+# 407d6facf51a782ae36e3c3be1958344024b0612 (Apache-2.0).
+
+[[source]]
+path = "vendor/gpui"
+url = "https://github.com/zed-industries/zed.git"
+rev = "93d745668805029476e6d7fbb19652116fed51de"
+branch = "our/gpui-external-compositor"
+patch = "patches/gpui.patch"
+patch_sha256 = "14bb5cec8918b21c9fdee2b9f8696f965acf8dfa48cdd13c549249ba2d62d41f"
+
+[[source]]
+path = "vendor/gpui-kit"
+url = "https://github.com/longbridge/gpui-kit.git"
+rev = "1ccf011620da24d633f7cd6d3c11ca2e97798dcf"
+branch = "our/gpui-compatible"
+patch = "patches/gpui-kit.patch"
+patch_sha256 = "9ec5a99ac5192e4a79fcef3c3e43ce10763e594f20fda75e688be8c2fe001bca"
