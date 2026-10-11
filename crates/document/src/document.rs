@@ -65,7 +65,9 @@ impl Document {
 
     pub fn insert_node(&mut self, index: usize, node: Node) {
         assert!(self.node(node.id).is_none(), "duplicate node ID");
-        self.next_id = self.next_id.max(node.id.0.checked_add(1).expect("node IDs exhausted"));
+        self.next_id = self
+            .next_id
+            .max(node.id.0.checked_add(1).expect("node IDs exhausted"));
         self.nodes.insert(index.min(self.nodes.len()), node);
         self.changed();
     }
