@@ -1,13 +1,13 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(pub(crate) u64);
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Node {
     pub id: NodeId,
     pub kind: NodeKind,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NodeKind {
     Rectangle(RectangleNode),
 }

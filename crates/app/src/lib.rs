@@ -1,8 +1,6 @@
 use gpui::{App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions, actions, px, size};
 use ruvector_ui::EditorView;
 
-// Commands here affect application lifecycle only. Document commands will be
-// owned by crates/commands after the GPU integration is validated.
 actions!(ruvector, [Quit]);
 
 pub fn run() {
@@ -23,6 +21,7 @@ pub fn run() {
     tracing::warn!("the external GPU compositor currently requires Linux/FreeBSD");
     gpui_platform::application().run(move |cx: &mut App| {
         gpui_base::init(cx);
+        ruvector_ui::init(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([
             #[cfg(target_os = "macos")]

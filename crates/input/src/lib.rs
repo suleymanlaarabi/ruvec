@@ -1,1 +1,6 @@
-// Reserved for the input layer; editor features follow GPU bridge validation.
+mod keyboard;
+mod modifiers;
+mod pointer;
+pub use keyboard::{Key, KeyEvent};
+pub use modifiers::Modifiers;
+pub use pointer::{PointerButton, PointerEvent};

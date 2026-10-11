@@ -15,3 +15,4 @@ thiserror.workspace = true
 ruvector-canvas.workspace = true
 
 ruvector-document.workspace = true
+ruvector-tools.workspace = true

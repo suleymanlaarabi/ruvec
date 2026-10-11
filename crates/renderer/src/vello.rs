@@ -1,5 +1,6 @@
 use ruvector_canvas::{Camera2D, Viewport};
 use ruvector_document::{Document, NodeKind, Selection};
+use ruvector_tools::ToolOverlay;
 use vello_gpu::{
     Scene,
     kurbo::{Affine, Rect, Stroke},
@@ -17,6 +18,7 @@ pub(super) fn populate_document(
     scene: &mut Scene,
     document: &Document,
     selection: &Selection,
+    overlay: ToolOverlay,
     camera: Camera2D,
     viewport: Viewport,
 ) {
@@ -31,7 +33,7 @@ pub(super) fn populate_document(
             rect.y + rect.height,
         ));
     }
-    if let Some(node) = selection.selected().and_then(|id| document.node(id)) {
+    for node in document.nodes().filter(|node| selection.contains(node.id)) {
         let NodeKind::Rectangle(rect) = &node.kind;
         // Draw the overlay in logical space so its width does not depend on zoom.
         let top_left = camera.world_to_screen(ruvector_canvas::Vec2::new(rect.x, rect.y));
@@ -49,6 +51,48 @@ pub(super) fn populate_document(
             bottom_right.y,
         ));
     }
+    match overlay {
+        ToolOverlay::None => {}
+        ToolOverlay::RectanglePreview { rect } => {
+            scene.set_transform(world_to_physical(camera, viewport));
+            scene.set_paint(AlphaColor::from_rgba8(75, 124, 240, 140));
+            scene.fill_rect(&rect);
+            stroke_overlay(
+                scene,
+                rect,
+                camera,
+                viewport,
+                AlphaColor::from_rgb8(125, 170, 255),
+            );
+        }
+        ToolOverlay::SelectionMarquee { rect } => {
+            scene.set_transform(world_to_physical(camera, viewport));
+            scene.set_paint(AlphaColor::from_rgba8(125, 170, 255, 35));
+            scene.fill_rect(&rect);
+            stroke_overlay(
+                scene,
+                rect,
+                camera,
+                viewport,
+                AlphaColor::from_rgb8(125, 170, 255),
+            );
+        }
+    }
+}
+
+fn stroke_overlay(
+    scene: &mut Scene,
+    rect: Rect,
+    camera: Camera2D,
+    viewport: Viewport,
+    color: AlphaColor<vello_gpu::peniko::color::Srgb>,
+) {
+    let a = camera.world_to_screen(ruvector_canvas::Vec2::new(rect.x0, rect.y0));
+    let b = camera.world_to_screen(ruvector_canvas::Vec2::new(rect.x1, rect.y1));
+    scene.set_transform(Affine::scale(viewport.scale()));
+    scene.set_stroke(Stroke::new(1.));
+    scene.set_paint(color);
+    scene.stroke_rect(&Rect::new(a.x, a.y, b.x, b.y));
 }
 
 #[cfg(test)]

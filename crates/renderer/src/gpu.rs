@@ -1,5 +1,6 @@
 use ruvector_canvas::{Camera2D, Viewport};
-use ruvector_document::{Document, NodeId, Selection};
+use ruvector_document::{Document, Selection};
+use ruvector_tools::ToolOverlay;
 use std::sync::Arc;
 use vello_gpu::{
     ClearSettings, RenderSize, RenderTargetConfig, Resources, Scene, TargetInit, TextureBindings,
@@ -15,7 +16,7 @@ pub struct GpuRenderer {
     view: Arc<wgpu::TextureView>,
     depth: wgpu::TextureView,
     size: RenderSize,
-    rendered_state: Option<(Camera2D, u64, Option<NodeId>)>,
+    rendered_state: Option<(Camera2D, u64, u64, ToolOverlay)>,
     viewport: Viewport,
 }
 
@@ -76,16 +77,24 @@ impl GpuRenderer {
         camera: Camera2D,
         document: &Document,
         selection: &Selection,
+        overlay: ToolOverlay,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
     ) -> Result<Arc<wgpu::TextureView>, RenderError> {
-        let state = (camera, document.revision(), selection.selected());
+        let state = (camera, document.revision(), selection.revision(), overlay);
         if self.rendered_state == Some(state) {
             return Ok(Arc::clone(&self.view));
         }
         self.scene.reset();
-        populate_document(&mut self.scene, document, selection, camera, self.viewport);
+        populate_document(
+            &mut self.scene,
+            document,
+            selection,
+            overlay,
+            camera,
+            self.viewport,
+        );
         self.renderer
             .render(
                 &self.scene,

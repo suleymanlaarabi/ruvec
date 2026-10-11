@@ -4772,10 +4772,24 @@ dependencies = [
 [[package]]
 name = "ruvector-commands"
 version = "0.1.0"
+dependencies = [
+ "ruvector-document",
+]
 
 [[package]]
 name = "ruvector-document"
 version = "0.1.0"
+
+[[package]]
+name = "ruvector-editor"
+version = "0.1.0"
+dependencies = [
+ "ruvector-canvas",
+ "ruvector-commands",
+ "ruvector-document",
+ "ruvector-input",
+ "ruvector-tools",
+]
 
 [[package]]
 name = "ruvector-geometry"
@@ -4784,6 +4798,9 @@ version = "0.1.0"
 [[package]]
 name = "ruvector-input"
 version = "0.1.0"
+dependencies = [
+ "kurbo",
+]
 
 [[package]]
 name = "ruvector-renderer"
@@ -4791,9 +4808,21 @@ version = "0.1.0"
 dependencies = [
  "ruvector-canvas",
  "ruvector-document",
+ "ruvector-tools",
  "thiserror 2.0.21",
  "vello_gpu",
  "wgpu",
+]
+
+[[package]]
+name = "ruvector-tools"
+version = "0.1.0"
+dependencies = [
+ "kurbo",
+ "ruvector-canvas",
+ "ruvector-commands",
+ "ruvector-document",
+ "ruvector-input",
 ]
 
 [[package]]
@@ -4804,7 +4833,10 @@ dependencies = [
  "gpui_wgpu",
  "naga",
  "ruvector-canvas",
+ "ruvector-editor",
+ "ruvector-input",
  "ruvector-renderer",
+ "ruvector-tools",
  "tracing",
 ]
 

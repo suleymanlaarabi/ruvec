@@ -1,19 +1,17 @@
 use std::{cell::RefCell, rc::Rc};
 
+use crate::input_adapter::logical_position;
+use crate::{actions::*, input_adapter};
 use gpui::{
     App, Bounds, Context, DispatchPhase, Element, ElementId, FocusHandle, GlobalElementId, Hitbox,
     HitboxBehavior, InspectorElementId, IntoElement, KeyDownEvent, KeyUpEvent, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels, Point, Render,
     ScrollDelta, ScrollWheelEvent, Style, Subscription, Window, div, prelude::*, rgb,
 };
-use ruvector_canvas::{CanvasInteraction, CanvasState, EditorState, Vec2};
-
-fn logical_position(position: Point<Pixels>) -> Vec2 {
-    Vec2::new(
-        f64::from(f32::from(position.x)),
-        f64::from(f32::from(position.y)),
-    )
-}
+use ruvector_canvas::CanvasState;
+use ruvector_editor::{EditorAction, EditorState, PointerPhase};
+use ruvector_input::{Key, KeyEvent};
+use ruvector_tools::{CursorStyle as ToolCursor, ToolId};
 
 fn scroll_camera(state: &mut CanvasState, event: &ScrollWheelEvent, origin: Point<Pixels>) -> bool {
     let before = state.camera;
@@ -79,14 +77,16 @@ mod native {
                     }
                 }
             }
+            let editor = self.editor.borrow();
             match self
                 .renderer
                 .as_mut()
                 .expect("renderer initialized")
                 .render(
                     self.navigation.borrow().camera,
-                    &self.editor.borrow().document,
-                    &self.editor.borrow().selection,
+                    &editor.document,
+                    &editor.selection,
+                    editor.tool_manager.overlay(),
                     &context.device,
                     &context.queue,
                     context.encoder,
@@ -258,11 +258,14 @@ impl Element for CanvasElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        // Hitbox IDs change between frames. Keep pointer capture on the current canvas.
-        if matches!(
-            self.navigation.borrow().interaction,
-            CanvasInteraction::Panning { .. } | CanvasInteraction::DraggingNode { .. }
-        ) {
+        let cursor = match self.editor.borrow().tool_manager.cursor() {
+            ToolCursor::Arrow => gpui::CursorStyle::Arrow,
+            ToolCursor::Crosshair => gpui::CursorStyle::Crosshair,
+            ToolCursor::Grab => gpui::CursorStyle::OpenHand,
+            ToolCursor::Grabbing => gpui::CursorStyle::ClosedHand,
+        };
+        window.set_cursor_style(cursor, hitbox);
+        if self.editor.borrow().tool_manager.is_interacting() {
             window.capture_pointer(hitbox.id);
         }
         let hitbox_down = hitbox.clone();
@@ -271,45 +274,25 @@ impl Element for CanvasElement {
             if phase != DispatchPhase::Bubble
                 || event.button != MouseButton::Left
                 || !hitbox_down.is_hovered(window)
+                || !bounds.contains(&event.position)
             {
                 return;
             }
             let _ = view.update(cx, |view, cx| {
                 window.focus(&view.focus, cx);
-                let changed = view.editor.borrow_mut().pointer_down(
+                let changed = view.editor.borrow_mut().pointer_event(
                     &mut view.navigation.borrow_mut(),
-                    logical_position(event.position - bounds.origin),
-                    view.space_down,
+                    input_adapter::pointer(
+                        event.position,
+                        bounds.origin,
+                        Some(event.button),
+                        event.modifiers,
+                    ),
+                    PointerPhase::Down,
                 );
-                if view.navigation.borrow().interaction != CanvasInteraction::Idle {
+                if view.editor.borrow().tool_manager.is_interacting() {
                     window.capture_pointer(hitbox_down.id);
                 }
-                if changed {
-                    cx.notify();
-                }
-                cx.stop_propagation();
-            });
-        });
-        let view = self.view.clone();
-        let navigation = self.navigation.clone();
-        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
-            if phase != DispatchPhase::Capture
-                || !matches!(
-                    navigation.borrow().interaction,
-                    CanvasInteraction::Panning { .. } | CanvasInteraction::DraggingNode { .. }
-                )
-            {
-                return;
-            }
-            let _ = view.update(cx, |view, cx| {
-                if event.pressed_button != Some(MouseButton::Left) {
-                    view.cancel_interaction(window);
-                    return;
-                }
-                let changed = view.editor.borrow_mut().drag_to(
-                    &mut view.navigation.borrow_mut(),
-                    logical_position(event.position - bounds.origin),
-                );
                 if changed {
                     view.scene_changed(cx);
                 }
@@ -317,20 +300,69 @@ impl Element for CanvasElement {
             });
         });
         let view = self.view.clone();
-        let navigation = self.navigation.clone();
-        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
-            if phase == DispatchPhase::Capture
-                && event.button == MouseButton::Left
-                && matches!(
-                    navigation.borrow().interaction,
-                    CanvasInteraction::Panning { .. } | CanvasInteraction::DraggingNode { .. }
-                )
+        let editor = self.editor.clone();
+        let move_hitbox = hitbox.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+            let interacting = editor.borrow().tool_manager.is_interacting();
+            if interacting {
+                if phase != DispatchPhase::Capture {
+                    return;
+                }
+            } else if phase != DispatchPhase::Bubble
+                || !move_hitbox.is_hovered(window)
+                || !bounds.contains(&event.position)
             {
-                let _ = view.update(cx, |view, cx| {
-                    view.cancel_interaction(window);
-                    cx.stop_propagation();
-                });
+                return;
             }
+            let _ = view.update(cx, |view, cx| {
+                if interacting && event.pressed_button != Some(MouseButton::Left) {
+                    view.cancel_interaction(window, cx);
+                    return;
+                }
+                let changed = view.editor.borrow_mut().pointer_event(
+                    &mut view.navigation.borrow_mut(),
+                    input_adapter::pointer(
+                        event.position,
+                        bounds.origin,
+                        event.pressed_button,
+                        event.modifiers,
+                    ),
+                    PointerPhase::Move,
+                );
+                if changed {
+                    view.scene_changed(cx);
+                }
+                if interacting {
+                    cx.stop_propagation();
+                }
+            });
+        });
+        let view = self.view.clone();
+        let editor = self.editor.clone();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+            if phase != DispatchPhase::Capture
+                || event.button != MouseButton::Left
+                || !editor.borrow().tool_manager.is_interacting()
+            {
+                return;
+            }
+            let _ = view.update(cx, |view, cx| {
+                let changed = view.editor.borrow_mut().pointer_event(
+                    &mut view.navigation.borrow_mut(),
+                    input_adapter::pointer(
+                        event.position,
+                        bounds.origin,
+                        Some(event.button),
+                        event.modifiers,
+                    ),
+                    PointerPhase::Up,
+                );
+                window.release_pointer();
+                if changed {
+                    view.scene_changed(cx);
+                }
+                cx.stop_propagation();
+            });
         });
         let scroll_hitbox = hitbox.clone();
         let view = self.view.clone();
@@ -345,9 +377,15 @@ impl Element for CanvasElement {
                 let changed =
                     scroll_camera(&mut view.navigation.borrow_mut(), event, bounds.origin);
                 if changed {
-                    view.editor.borrow().rebase_drag(
+                    view.editor.borrow_mut().pointer_event(
                         &mut view.navigation.borrow_mut(),
-                        logical_position(event.position - bounds.origin),
+                        input_adapter::pointer(
+                            event.position,
+                            bounds.origin,
+                            None,
+                            event.modifiers,
+                        ),
+                        PointerPhase::CameraChanged,
                     );
                     view.scene_changed(cx);
                 }
@@ -374,9 +412,15 @@ impl Element for CanvasElement {
                     state.camera != before
                 };
                 if changed {
-                    view.editor.borrow().rebase_drag(
+                    view.editor.borrow_mut().pointer_event(
                         &mut view.navigation.borrow_mut(),
-                        logical_position(event.position - bounds.origin),
+                        input_adapter::pointer(
+                            event.position,
+                            bounds.origin,
+                            None,
+                            window.modifiers(),
+                        ),
+                        PointerPhase::CameraChanged,
                     );
                     view.scene_changed(cx);
                 }
@@ -416,15 +460,15 @@ impl CanvasView {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         let subscriptions = [
-            cx.observe_window_activation(window, |view, window, _| {
+            cx.observe_window_activation(window, |view, window, cx| {
                 if !window.is_window_active() {
                     view.space_down = false;
-                    view.cancel_interaction(window);
+                    view.cancel_interaction(window, cx);
                 }
             }),
-            cx.on_blur(&focus, window, |view, window, _| {
+            cx.on_blur(&focus, window, |view, window, cx| {
                 view.space_down = false;
-                view.cancel_interaction(window);
+                view.cancel_interaction(window, cx);
             }),
         ];
         let view = cx.entity().downgrade();
@@ -446,11 +490,42 @@ impl CanvasView {
         }
     }
 
-    fn cancel_interaction(&mut self, window: &mut Window) {
-        self.navigation.borrow_mut().end_pan();
-        window.release_pointer();
+    pub(super) fn focus_handle(&self) -> FocusHandle {
+        self.focus.clone()
+    }
+    pub(super) fn active_tool(&self) -> ToolId {
+        self.editor.borrow().tool_manager.effective()
     }
 
+    fn cancel_interaction(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let changed = self
+            .editor
+            .borrow_mut()
+            .cancel(&mut self.navigation.borrow_mut());
+        let hand_changed = if self.space_down {
+            false
+        } else {
+            self.editor
+                .borrow_mut()
+                .temporary_hand(&mut self.navigation.borrow_mut(), false)
+        };
+        window.release_pointer();
+        if changed || hand_changed {
+            self.scene_changed(cx);
+        }
+    }
+
+    fn action(&mut self, action: EditorAction, window: &mut Window, cx: &mut Context<Self>) {
+        let changed = self
+            .editor
+            .borrow_mut()
+            .action(&mut self.navigation.borrow_mut(), action);
+        window.release_pointer();
+        if changed {
+            self.scene_changed(cx);
+        }
+        cx.stop_propagation();
+    }
     fn scene_changed(&self, cx: &mut Context<Self>) {
         let camera = self.navigation.borrow().camera;
         tracing::debug!(
@@ -465,10 +540,30 @@ impl CanvasView {
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if event.keystroke.key == "space" {
-            self.space_down = true;
+            if !self.space_down {
+                self.space_down = true;
+                let changed = self
+                    .editor
+                    .borrow_mut()
+                    .temporary_hand(&mut self.navigation.borrow_mut(), true);
+                window.release_pointer();
+                if changed {
+                    self.scene_changed(cx);
+                }
+            }
             cx.stop_propagation();
         } else if event.keystroke.key == "escape" {
-            self.cancel_interaction(window);
+            let changed = self.editor.borrow_mut().key_event(
+                &mut self.navigation.borrow_mut(),
+                KeyEvent {
+                    key: Key::Escape,
+                    modifiers: input_adapter::modifiers(event.keystroke.modifiers),
+                },
+            );
+            window.release_pointer();
+            if changed {
+                self.scene_changed(cx);
+            }
             cx.stop_propagation();
         }
     }
@@ -476,13 +571,33 @@ impl CanvasView {
     fn key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         if event.keystroke.key == "space" {
             self.space_down = false;
-            if matches!(
-                self.navigation.borrow().interaction,
-                CanvasInteraction::Panning { .. }
-            ) {
-                self.cancel_interaction(window);
+            let changed = self
+                .editor
+                .borrow_mut()
+                .temporary_hand(&mut self.navigation.borrow_mut(), false);
+            window.release_pointer();
+            if changed {
+                self.scene_changed(cx);
             }
             cx.stop_propagation();
+        }
+    }
+
+    fn modifiers_changed(
+        &mut self,
+        event: &gpui::ModifiersChangedEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = self.editor.borrow_mut().key_event(
+            &mut self.navigation.borrow_mut(),
+            KeyEvent {
+                key: Key::ModifiersChanged,
+                modifiers: input_adapter::modifiers(event.modifiers),
+            },
+        );
+        if changed {
+            self.scene_changed(cx);
         }
     }
 }
@@ -492,7 +607,7 @@ impl Render for CanvasView {
         div()
             .id("canvas")
             .track_focus(&self.focus)
-            .key_context("Canvas")
+            .key_context("Editor")
             .flex_1()
             .min_w_0()
             .min_h_0()
@@ -500,6 +615,32 @@ impl Render for CanvasView {
             .bg(rgb(0x181b22))
             .on_key_down(cx.listener(Self::key_down))
             .on_key_up(cx.listener(Self::key_up))
+            .on_modifiers_changed(cx.listener(Self::modifiers_changed))
+            .on_action(cx.listener(|this, _: &ActivateSelectTool, window, cx| {
+                this.action(EditorAction::Activate(ToolId::Select), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivateRectangleTool, window, cx| {
+                this.action(EditorAction::Activate(ToolId::Rectangle), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivateHandTool, window, cx| {
+                this.action(EditorAction::Activate(ToolId::Hand), window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &Undo, window, cx| {
+                    this.action(EditorAction::Undo, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &Redo, window, cx| {
+                    this.action(EditorAction::Redo, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &DeleteSelection, window, cx| {
+                this.action(EditorAction::Delete, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DuplicateSelection, window, cx| {
+                this.action(EditorAction::Duplicate, window, cx)
+            }))
             .child(CanvasElement {
                 navigation: self.navigation.clone(),
                 editor: self.editor.clone(),
@@ -515,6 +656,7 @@ impl Render for CanvasView {
 mod tests {
     use super::*;
     use gpui::{Modifiers, point, px};
+    use ruvector_canvas::Vec2;
 
     #[test]
     fn wheel_zooms_about_canvas_local_cursor_even_without_modifiers() {

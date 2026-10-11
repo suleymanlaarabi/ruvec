@@ -1,0 +1,16 @@
+[package]
+name = "ruvector-editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ruvector-canvas.workspace = true
+ruvector-document.workspace = true
+ruvector-commands.workspace = true
+ruvector-input.workspace = true
+ruvector-tools.workspace = true

@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "apps/desktop", "crates/app", "crates/ui", "crates/canvas",
     "crates/renderer", "crates/document", "crates/geometry",
-    "crates/commands", "crates/input",
+    "crates/commands", "crates/input", "crates/tools", "crates/editor",
 ]
 exclude = ["vendor/gpui", "vendor/gpui-kit"]
 default-members = ["apps/desktop"]
@@ -23,6 +23,8 @@ ruvector-document = { path = "crates/document" }
 ruvector-geometry = { path = "crates/geometry" }
 ruvector-commands = { path = "crates/commands" }
 ruvector-input = { path = "crates/input" }
+ruvector-tools = { path = "crates/tools" }
+ruvector-editor = { path = "crates/editor" }
 
 gpui = { path = "vendor/gpui/crates/gpui", default-features = false }
 gpui_platform = { path = "vendor/gpui/crates/gpui_platform", features = ["font-kit", "wayland", "x11", "runtime_shaders"] }

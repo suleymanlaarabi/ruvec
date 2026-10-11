@@ -1,11 +1,9 @@
 mod camera;
-mod editor_state;
 mod hit_test;
 mod interaction;
 mod state;
 
 pub use camera::Camera2D;
-pub use editor_state::EditorState;
 pub use hit_test::hit_test;
 pub use interaction::CanvasInteraction;
 pub use kurbo::Vec2;

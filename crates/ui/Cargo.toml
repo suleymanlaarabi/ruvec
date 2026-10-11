@@ -11,6 +11,9 @@ workspace = true
 [dependencies]
 gpui.workspace = true
 ruvector-canvas.workspace = true
+ruvector-editor.workspace = true
+ruvector-tools.workspace = true
+ruvector-input.workspace = true
 ruvector-renderer.workspace = true
 tracing.workspace = true
 

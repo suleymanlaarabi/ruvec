@@ -56,6 +56,20 @@ impl Document {
         self.nodes.iter()
     }
 
+    pub fn remove_node(&mut self, id: NodeId) -> Option<(usize, Node)> {
+        let index = self.nodes.iter().position(|node| node.id == id)?;
+        let node = self.nodes.remove(index);
+        self.changed();
+        Some((index, node))
+    }
+
+    pub fn insert_node(&mut self, index: usize, node: Node) {
+        assert!(self.node(node.id).is_none(), "duplicate node ID");
+        self.next_id = self.next_id.max(node.id.0.checked_add(1).expect("node IDs exhausted"));
+        self.nodes.insert(index.min(self.nodes.len()), node);
+        self.changed();
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
